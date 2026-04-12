@@ -8,6 +8,7 @@ import { promisify } from 'node:util'
 import {
   CONTEXT_PATH,
   LEON_DISABLED_CONTEXT_FILES,
+  NODE_RUNTIME_BIN_PATH,
   TSX_CLI_PATH
 } from '@/constants'
 import { TOOLKIT_REGISTRY, LLM_PROVIDER } from '@/core'
@@ -23,8 +24,16 @@ interface ContextFileMetadata {
   lastGeneratedAt: number
 }
 
-const CONTEXT_FILES_SOURCE_DIR = path.join(
+const CONTEXT_FILES_RUNTIME_DIR = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
+  'context-files'
+)
+const CONTEXT_FILES_SOURCE_DIR = path.join(
+  process.cwd(),
+  'server',
+  'src',
+  'core',
+  'context-manager',
   'context-files'
 )
 const CONTEXT_MANAGER_DIR = path.dirname(fileURLToPath(import.meta.url))
@@ -85,6 +94,7 @@ export default class ContextManager {
     this.probeHelper,
     DEFAULT_CONTEXT_REFRESH_TTL_MS,
     {
+      getWorkflowLLMName: () => LLM_PROVIDER.workflowLLMName,
       getAgentLLMName: () => LLM_PROVIDER.agentLLMName,
       getLocalLLMName: () => LLM_PROVIDER.localLLMName
     }
@@ -356,14 +366,21 @@ export default class ContextManager {
 
   private resolveContextSourcePath(definition: ContextFile): string | null {
     const sourceBasename = this.getContextSourceBasename(definition.filename)
-    const tsPath = path.join(CONTEXT_FILES_SOURCE_DIR, `${sourceBasename}.ts`)
-    if (fs.existsSync(tsPath)) {
-      return tsPath
-    }
+    const sourceDirectories = [
+      CONTEXT_FILES_SOURCE_DIR,
+      CONTEXT_FILES_RUNTIME_DIR
+    ]
 
-    const jsPath = path.join(CONTEXT_FILES_SOURCE_DIR, `${sourceBasename}.js`)
-    if (fs.existsSync(jsPath)) {
-      return jsPath
+    for (const sourceDirectory of sourceDirectories) {
+      const tsPath = path.join(sourceDirectory, `${sourceBasename}.ts`)
+      if (fs.existsSync(tsPath)) {
+        return tsPath
+      }
+
+      const jsPath = path.join(sourceDirectory, `${sourceBasename}.js`)
+      if (fs.existsSync(jsPath)) {
+        return jsPath
+      }
     }
 
     return null
@@ -439,6 +456,8 @@ export default class ContextManager {
       ...this.getContextRefreshWorkerArgs(),
       '--filename',
       definition.filename,
+      '--workflow-llm-name',
+      LLM_PROVIDER.workflowLLMName,
       '--agent-llm-name',
       LLM_PROVIDER.agentLLMName,
       '--local-llm-name',
@@ -446,7 +465,7 @@ export default class ContextManager {
     ]
 
     try {
-      const { stdout } = await execFileAsync(process.execPath, workerArgs, {
+      const { stdout } = await execFileAsync(NODE_RUNTIME_BIN_PATH, workerArgs, {
         cwd: process.cwd(),
         maxBuffer: CONTEXT_REFRESH_WORKER_MAX_BUFFER
       })

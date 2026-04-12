@@ -9,7 +9,7 @@ import {
   ListHeader,
   ListItem,
   Loader
-} from '@leon-ai/aurora'
+} from '@aurora'
 
 const container = document.querySelector('#init')
 const root = createRoot(container)
@@ -96,12 +96,23 @@ function SuccessListItem({ children }) {
 function Init() {
   const parentRef = useRef(null)
   const [config, setConfig] = useState(() => ({ ...window.leonConfigInfo }))
+  const usesLocalLLM =
+    config.llm?.workflowProvider === 'llamacpp' ||
+    config.llm?.agentProvider === 'llamacpp' ||
+    config.llm?.workflowProvider === 'sglang' ||
+    config.llm?.agentProvider === 'sglang'
+  const usesLlamaCPP =
+    config.llm?.workflowProvider === 'llamacpp' ||
+    config.llm?.agentProvider === 'llamacpp'
   const [statusMap, setStatusMap] = useState({
     clientCoreServerHandshake: 'loading',
     tcpServerBoot:
       window.leonConfigInfo?.tcpServer?.enabled === false ? 'success' : 'loading',
-    llm: 'loading',
-    llmDutiesWarmUp: 'loading'
+    llamaServerBoot:
+      window.leonConfigInfo?.llm?.workflowProvider === 'llamacpp' ||
+      window.leonConfigInfo?.llm?.agentProvider === 'llamacpp'
+        ? 'loading'
+        : 'success'
   })
 
   useEffect(() => {
@@ -132,14 +143,9 @@ function Init() {
   for (let key of Object.keys(statusMap)) {
     if (key === 'tcpServerBoot' && config.tcpServer?.enabled === false) {
       statuses.push('success')
-    }
-    // If LLM is not enabled, we don't need to check for LLM duties warm up
-    else if (
-      key === 'llmDutiesWarmUp' &&
-      (!config.llm?.enabled || !config.shouldWarmUpLLMDuties)
-    ) {
+    } else if (key === 'llamaServerBoot' && !usesLlamaCPP) {
       statuses.push('success')
-    } else if (!config[key] || config[key].enabled) {
+    } else {
       statuses.push(statusMap[key])
     }
   }
@@ -181,13 +187,8 @@ function Init() {
             {config.tcpServer?.enabled !== false && (
               <Item status={statusMap.tcpServerBoot}>TCP server booted</Item>
             )}
-            {config.llm && config.llm.enabled && (
-              <Item status={statusMap.llm}>LLM loaded</Item>
-            )}
-            {config.shouldWarmUpLLMDuties && (
-              <Item status={statusMap.llmDutiesWarmUp}>
-                LLM duties warmed up
-              </Item>
+            {usesLlamaCPP && (
+              <Item status={statusMap.llamaServerBoot}>llama-server booted</Item>
             )}
           </List>
         </WidgetWrapper>

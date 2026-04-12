@@ -6,7 +6,7 @@ import { createMoonshotAI } from '@ai-sdk/moonshotai'
 import { createHuggingFace } from '@ai-sdk/huggingface'
 import { createCerebras } from '@ai-sdk/cerebras'
 import { createGroq } from '@ai-sdk/groq'
-import { createWebSocketFetch } from 'ai-sdk-openai-websocket-fetch'
+import { createWebSocketFetch } from '@vercel/ai-sdk-openai-websocket-fetch'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 
 import type {
@@ -34,11 +34,10 @@ interface AISDKRemoteProviderConfig {
   name: string
   providerName: string
   apiKeyEnv: string
-  agentModelEnv: string
-  modelEnv: string
-  defaultModel: string
+  model: string
   baseURL: string
   flavor: AISDKFlavor
+  requiresApiKey?: boolean
   sendApiKeyAsBearer?: boolean
   headers?: (apiKey: string) => Record<string, string>
 }
@@ -65,19 +64,18 @@ export default class AISDKRemoteLLMProvider {
   protected readonly model: string
 
   private readonly config: AISDKRemoteProviderConfig
-  private readonly languageModel: unknown
+  private languageModel: unknown
   private openAIWebSocketFetch:
     | ReturnType<typeof createWebSocketFetch>
     | undefined
 
-  constructor(config: AISDKRemoteProviderConfig) {
+  constructor(
+    config: AISDKRemoteProviderConfig
+  ) {
     this.config = config
     this.name = config.name
     this.apiKey = process.env[config.apiKeyEnv]
-    this.model =
-      process.env[config.agentModelEnv] ||
-      process.env[config.modelEnv] ||
-      config.defaultModel
+    this.model = config.model
 
     LogHelper.title(this.name)
     LogHelper.success('New instance')
@@ -94,7 +92,22 @@ export default class AISDKRemoteLLMProvider {
     this.openAIWebSocketFetch?.close()
   }
 
+  protected setBaseURL(baseURL: string): void {
+    if (this.config.baseURL === baseURL) {
+      return
+    }
+
+    this.config.baseURL = baseURL
+    this.openAIWebSocketFetch?.close()
+    this.openAIWebSocketFetch = undefined
+    this.languageModel = this.createLanguageModel()
+  }
+
   private checkAPIKey(): void {
+    if (this.config.requiresApiKey === false) {
+      return
+    }
+
     if (!this.apiKey || this.apiKey === '') {
       LogHelper.title(this.name)
 
@@ -125,7 +138,11 @@ export default class AISDKRemoteLLMProvider {
         name: this.config.providerName,
         baseURL: this.config.baseURL,
         includeUsage: true,
-        ...(this.config.sendApiKeyAsBearer === false ? {} : { apiKey }),
+        ...(
+          this.config.sendApiKeyAsBearer === false || !apiKey
+            ? {}
+            : { apiKey }
+        ),
         ...(headers && Object.keys(headers).length > 0 ? { headers } : {})
       })
 
@@ -140,7 +157,11 @@ export default class AISDKRemoteLLMProvider {
         ...(headers && Object.keys(headers).length > 0 ? { headers } : {})
       })
 
-      return provider.chat(this.model)
+      return provider.chat(this.model, {
+        usage: {
+          include: true
+        }
+      })
     }
 
     if (this.config.flavor === 'anthropic') {
@@ -194,6 +215,9 @@ export default class AISDKRemoteLLMProvider {
     }
 
     throw new Error(`Unsupported AI SDK flavor: ${this.config.flavor}`)
+  }
+  private getLanguageModel(): unknown {
+    return this.languageModel
   }
 
   private getOpenAIWebSocketFetch(): ReturnType<typeof createWebSocketFetch> {
@@ -708,7 +732,31 @@ export default class AISDKRemoteLLMProvider {
     }
   }
 
-  private buildOpenAICompatiblePayload(state: CallState): Record<string, unknown> {
+  private appendProviderMetadataUsageFromUnknown(
+    state: CallState,
+    providerMetadata: unknown
+  ): void {
+    if (!providerMetadata || typeof providerMetadata !== 'object') {
+      return
+    }
+
+    const providerMetadataObject = providerMetadata as Record<string, unknown>
+
+    if (
+      providerMetadataObject['openrouter'] &&
+      typeof providerMetadataObject['openrouter'] === 'object'
+    ) {
+      const openrouterMetadata = providerMetadataObject['openrouter'] as Record<
+        string,
+        unknown
+      >
+      this.appendUsageFromUnknown(state, openrouterMetadata['usage'])
+    }
+  }
+
+  private buildOpenAICompatiblePayload(
+    state: CallState
+  ): Record<string, unknown> {
     const toolCalls: OpenAIToolCall[] = state.toolCallOrder
       .map((toolCallId, index) => {
         const call = state.toolCallsById[toolCallId]
@@ -755,8 +803,9 @@ export default class AISDKRemoteLLMProvider {
   ): Promise<Record<string, unknown>> {
     const state = this.createCallState()
     const callOptions = this.buildCallOptions(prompt, completionParams)
+    const languageModel = this.getLanguageModel()
     const result = await (
-      this.languageModel as {
+      languageModel as {
         doGenerate: (
           options: Record<string, unknown>
         ) => Promise<Record<string, unknown>>
@@ -798,6 +847,7 @@ export default class AISDKRemoteLLMProvider {
     }
 
     this.appendUsageFromUnknown(state, result['usage'])
+    this.appendProviderMetadataUsageFromUnknown(state, result['providerMetadata'])
 
     return this.buildOpenAICompatiblePayload(state)
   }
@@ -808,12 +858,14 @@ export default class AISDKRemoteLLMProvider {
   ): Promise<Record<string, unknown>> {
     const state = this.createCallState()
     const callOptions = this.buildCallOptions(prompt, completionParams)
+    const languageModel = this.getLanguageModel()
     const result = await (
-      this.languageModel as {
+      languageModel as {
         doStream: (
           options: Record<string, unknown>
         ) => Promise<{
           stream: AsyncIterable<Record<string, unknown>>
+          response?: unknown
         }>
       }
     ).doStream(callOptions)
@@ -952,6 +1004,10 @@ export default class AISDKRemoteLLMProvider {
 
       if (type === 'finish' || type === 'finish-step') {
         this.appendUsageFromUnknown(state, part['usage'])
+        this.appendProviderMetadataUsageFromUnknown(
+          state,
+          part['providerMetadata']
+        )
         continue
       }
 
@@ -971,21 +1027,13 @@ export default class AISDKRemoteLLMProvider {
     prompt: PromptOrChatHistory,
     completionParams: CompletionParams
   ): Promise<AxiosResponse> {
-    return new Promise(async (resolve, reject) => {
-      try {
-        this.checkAPIKey()
+    this.checkAPIKey()
 
-        const responseData =
-          completionParams.shouldStream === true
-            ? await this.runStreamingCompletion(prompt, completionParams)
-            : await this.runNonStreamingCompletion(prompt, completionParams)
-
-        return resolve({
-          data: responseData
-        } as AxiosResponse)
-      } catch (e) {
-        return reject(e instanceof Error ? e : new Error(String(e)))
-      }
-    })
+    return (completionParams.shouldStream === true
+      ? this.runStreamingCompletion(prompt, completionParams)
+      : this.runNonStreamingCompletion(prompt, completionParams)
+    ).then((responseData) => ({
+      data: responseData
+    })) as Promise<AxiosResponse>
   }
 }

@@ -1,8 +1,8 @@
 import { createElement } from 'react'
 import { createRoot } from 'react-dom/client'
 import axios from 'axios'
-// eslint-disable-next-line no-redeclare
-import { WidgetWrapper, Flexbox, Loader, Text } from '@leon-ai/aurora'
+
+import { WidgetWrapper, Flexbox, Loader, Text } from '@aurora'
 
 import renderAuroraComponent from './render-aurora-component'
 import ToolUIHandler from './tool-ui-handler'
@@ -11,6 +11,17 @@ const WIDGETS_TO_FETCH = []
 const WIDGETS_FETCH_CACHE = new Map()
 const REPLACED_MESSAGES = new Set()
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 24
+const MAXIMUM_BUBBLES_IN_MEMORY = 62
+const MAXIMUM_WIDGET_FETCH_CONCURRENCY = 4
+
+function escapeHTML(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
 
 export default class Chatbot {
   constructor(socket, serverURL) {
@@ -20,11 +31,11 @@ export default class Chatbot {
     this.feed = document.querySelector('#feed')
     this.typing = document.querySelector('#is-typing')
     this.noBubbleMessage = document.querySelector('#no-bubble')
-    this.bubbles = localStorage.getItem('bubbles')
-    this.parsedBubbles = JSON.parse(this.bubbles)
+    this.parsedBubbles = []
     this.reasoningBlocks = new Map()
     this.feedAutoScrollEnabled = true
     this.isProgrammaticFeedScroll = false
+    this.widgetHydrationPromise = null
 
     // Initialize tool UI handler
     this.toolUIHandler = new ToolUIHandler(
@@ -41,7 +52,8 @@ export default class Chatbot {
     this.et.addEventListener('to-leon', (event) => {
       this.createBubble({
         who: 'me',
-        string: event.detail
+        string: event.detail.string,
+        sentAt: event.detail.sentAt
       })
     })
 
@@ -71,9 +83,16 @@ export default class Chatbot {
     )
   }
 
-  sendTo(who, string) {
+  sendTo(who, string, sentAt = Date.now()) {
     if (who === 'leon') {
-      this.et.dispatchEvent(new CustomEvent('to-leon', { detail: string }))
+      this.et.dispatchEvent(
+        new CustomEvent('to-leon', {
+          detail: {
+            string,
+            sentAt
+          }
+        })
+      )
     }
   }
 
@@ -191,112 +210,201 @@ export default class Chatbot {
     return Boolean(data && typeof data === 'object' && data.widget === 'PlanWidget')
   }
 
-  loadFeed() {
-    return new Promise(async (resolve) => {
-      if (this.parsedBubbles === null || this.parsedBubbles.length === 0) {
-        this.noBubbleMessage.classList.remove('hide')
-        localStorage.setItem('bubbles', JSON.stringify([]))
-        this.parsedBubbles = []
-        resolve()
-      } else {
-        for (let i = 0; i < this.parsedBubbles.length; i += 1) {
-          const bubble = this.parsedBubbles[i]
+  isSystemWidgetData(data) {
+    return Boolean(
+      data &&
+        typeof data === 'object' &&
+        data.historyMode &&
+        data.historyMode === 'system_widget'
+    )
+  }
 
-          // Skip tool output markers when recreating bubbles
-          if (
-            bubble.originalString &&
-            ToolUIHandler.isToolOutputMarker(bubble.originalString)
-          ) {
-            continue
-          }
+  getTimelineItemWeight(item) {
+    if (item.who === 'owner') {
+      return 0
+    }
 
-          this.createBubble({
-            who: bubble.who,
-            string: bubble.originalString
-              ? bubble.originalString
-              : bubble.string,
-            save: false,
-            isCreatingFromLoadingFeed: true
-          })
+    if (item.source === 'system_widget') {
+      return 1
+    }
 
-          if (i + 1 === this.parsedBubbles.length) {
-            setTimeout(() => {
-              resolve()
-            }, 100)
-          }
-        }
+    return 2
+  }
 
-        /**
-         * Browse widgets that need to be fetched.
-         * Reverse widgets to fetch the last widgets first.
-         * Replace the loading content with the fetched widget
-         */
-        const widgetContainers = WIDGETS_TO_FETCH.reverse()
-        for (let i = 0; i < widgetContainers.length; i += 1) {
-          const widgetContainer = widgetContainers[i]
-          const hasWidgetBeenFetched = WIDGETS_FETCH_CACHE.has(
-            widgetContainer.widgetId
-          )
+  async hydrateFetchedWidgets() {
+    if (this.widgetHydrationPromise) {
+      return this.widgetHydrationPromise
+    }
 
-          if (hasWidgetBeenFetched) {
-            const fetchedWidget = WIDGETS_FETCH_CACHE.get(
-              widgetContainer.widgetId
-            )
-            widgetContainer.reactRootNode.render(fetchedWidget.reactNode)
+    const widgetContainers = [...WIDGETS_TO_FETCH].reverse()
+    WIDGETS_TO_FETCH.length = 0
 
-            setTimeout(() => {
-              this.scrollDown()
-            }, 100)
+    if (widgetContainers.length === 0) {
+      return Promise.resolve()
+    }
 
-            continue
-          }
+    const hydrateWidgetContainer = async (widgetContainer) => {
+      const hasWidgetBeenFetched = WIDGETS_FETCH_CACHE.has(
+        widgetContainer.widgetId
+      )
 
-          const data = await axios.get(
-            `${this.serverURL}/api/v1/fetch-widget?skill_action=${widgetContainer.onFetch.actionName}&widget_id=${widgetContainer.widgetId}`
-          )
-          const fetchedWidget = data.data.widget
-          const reactNode = fetchedWidget
-            ? renderAuroraComponent(
-                this.socket,
-                fetchedWidget.componentTree,
-                fetchedWidget.supportedEvents
-              )
-            : createElement(WidgetWrapper, {
-                children: createElement(Flexbox, {
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  children: createElement(Text, {
-                    secondary: true,
-                    children: 'This widget has been deleted.'
-                  })
-                })
-              })
+      if (hasWidgetBeenFetched) {
+        const fetchedWidget = WIDGETS_FETCH_CACHE.get(widgetContainer.widgetId)
+        widgetContainer.reactRootNode.render(fetchedWidget.reactNode)
 
-          widgetContainer.reactRootNode.render(reactNode)
-          WIDGETS_FETCH_CACHE.set(widgetContainer.widgetId, {
-            ...fetchedWidget,
-            reactNode
-          })
-          setTimeout(() => {
-            this.scrollDown()
-          }, 100)
-        }
+        setTimeout(() => {
+          this.scrollDown()
+        }, 100)
+
+        return
       }
-    })
+
+      const data = await axios.get(
+        `${this.serverURL}/api/v1/fetch-widget?skill_action=${widgetContainer.onFetch.actionName}&widget_id=${widgetContainer.widgetId}`
+      )
+      const fetchedWidget = data.data.widget
+      const reactNode = fetchedWidget
+        ? renderAuroraComponent(
+            this.socket,
+            fetchedWidget.componentTree,
+            fetchedWidget.supportedEvents
+          )
+        : createElement(WidgetWrapper, {
+            children: createElement(Flexbox, {
+              alignItems: 'center',
+              justifyContent: 'center',
+              children: createElement(Text, {
+                secondary: true,
+                children: 'This widget has been deleted.'
+              })
+            })
+          })
+
+      widgetContainer.reactRootNode.render(reactNode)
+      WIDGETS_FETCH_CACHE.set(widgetContainer.widgetId, {
+        ...fetchedWidget,
+        reactNode
+      })
+      setTimeout(() => {
+        this.scrollDown()
+      }, 100)
+    }
+
+    const workerCount = Math.min(
+      MAXIMUM_WIDGET_FETCH_CONCURRENCY,
+      widgetContainers.length
+    )
+    let currentIndex = 0
+
+    this.widgetHydrationPromise = Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (currentIndex < widgetContainers.length) {
+          const widgetContainer = widgetContainers[currentIndex]
+          currentIndex += 1
+
+          if (!widgetContainer) {
+            continue
+          }
+
+          await hydrateWidgetContainer(widgetContainer)
+        }
+      })
+    )
+      .catch((error) => {
+        console.error('Failed to hydrate fetched widgets:', error)
+      })
+      .finally(() => {
+        this.widgetHydrationPromise = null
+      })
+
+    return this.widgetHydrationPromise
+  }
+
+  async loadFeed() {
+    WIDGETS_TO_FETCH.length = 0
+
+    const [historyResponse, systemWidgetsResponse] = await Promise.all([
+      axios.get(
+        `${this.serverURL}/api/v1/conversation-history?supports_widgets=true`
+      ),
+      axios.get(`${this.serverURL}/api/v1/system-widgets?supports_widgets=true`)
+    ])
+    const history = Array.isArray(historyResponse.data?.history)
+      ? historyResponse.data.history
+      : []
+    const systemWidgets = Array.isArray(systemWidgetsResponse.data?.widgets)
+      ? systemWidgetsResponse.data.widgets
+      : []
+
+    const timelineItems = [...history, ...systemWidgets]
+      .map((item, index) => ({
+        ...item,
+        sortIndex: index
+      }))
+      .sort((left, right) => {
+        if (left.sentAt !== right.sentAt) {
+          return left.sentAt - right.sentAt
+        }
+
+        const leftWeight = this.getTimelineItemWeight(left)
+        const rightWeight = this.getTimelineItemWeight(right)
+
+        if (leftWeight !== rightWeight) {
+          return leftWeight - rightWeight
+        }
+
+        return left.sortIndex - right.sortIndex
+      })
+
+    this.parsedBubbles = history
+
+    if (timelineItems.length === 0) {
+      this.noBubbleMessage.classList.remove('hide')
+      return
+    }
+
+    for (let i = 0; i < timelineItems.length; i += 1) {
+      const bubble = timelineItems[i]
+
+      if (
+        bubble.originalString &&
+        ToolUIHandler.isToolOutputMarker(bubble.originalString)
+      ) {
+        continue
+      }
+
+      this.createBubble({
+        who: bubble.who === 'owner' ? 'me' : bubble.who,
+        string: bubble.originalString ? bubble.originalString : bubble.string,
+        metrics: bubble.llmMetrics || null,
+        sentAt: bubble.sentAt,
+        save: false,
+        isCreatingFromLoadingFeed: true,
+        messageId: bubble.messageId
+      })
+    }
+
+    void this.hydrateFetchedWidgets()
   }
 
   createBubble(params) {
     const {
       who,
       string,
+      metrics = null,
       save = true,
       bubbleId,
       isCreatingFromLoadingFeed = false,
       messageId,
+      sentAt = null,
       beforeElement = null
     } = params
     const container = document.createElement('div')
     const bubble = document.createElement('p')
+
+    if (!this.noBubbleMessage.classList.contains('hide')) {
+      this.noBubbleMessage.classList.add('hide')
+    }
 
     container.className = `bubble-container ${who}`
     bubble.className = 'bubble'
@@ -324,6 +432,16 @@ export default class Chatbot {
       this.feed.appendChild(container)
     }
     container.appendChild(bubble)
+
+    if (who === 'leon' && metrics) {
+      container.appendChild(this.createMetricsElement(metrics, sentAt))
+    } else if (who === 'me') {
+      const timestampElement = this.createTimestampElement(sentAt)
+
+      if (timestampElement) {
+        container.appendChild(timestampElement)
+      }
+    }
 
     let widgetComponentTree = null
     let widgetSupportedEvents = null
@@ -381,7 +499,7 @@ export default class Chatbot {
     }
 
     if (save) {
-      this.saveBubble(who, originalString, formattedString, messageId)
+      this.saveBubble(who, originalString, formattedString, messageId, metrics, sentAt)
     }
 
     return container
@@ -462,7 +580,7 @@ export default class Chatbot {
   handleToolOutput(data) {
     const result = this.toolUIHandler.handleToolOutput(data)
 
-    // Save to localStorage if it's a new group
+    // Save in memory if it's a new group
     if (result && result.isNewGroup) {
       const { toolkitName, toolName, answer } = data
       const toolInfo = this.toolUIHandler.getToolGroupInfo(
@@ -481,23 +599,31 @@ export default class Chatbot {
     }
   }
 
-  saveBubble(who, originalString, string, messageId) {
+  saveBubble(
+    who,
+    originalString,
+    string,
+    messageId,
+    metrics = null,
+    sentAt = null
+  ) {
     if (!this.noBubbleMessage.classList.contains('hide')) {
       this.noBubbleMessage.classList.add('hide')
     }
 
-    if (this.parsedBubbles.length === 62) {
+    if (this.parsedBubbles.length === MAXIMUM_BUBBLES_IN_MEMORY) {
       this.parsedBubbles.shift()
     }
 
     // Store both original and formatted strings
     this.parsedBubbles.push({
       who,
+      sentAt,
       string,
       originalString,
-      messageId
+      messageId,
+      llmMetrics: metrics
     })
-    localStorage.setItem('bubbles', JSON.stringify(this.parsedBubbles))
     this.scrollDown()
   }
 
@@ -506,6 +632,7 @@ export default class Chatbot {
       message.includes && message.includes('"component":"WidgetWrapper"')
 
     if (typeof message === 'string' && !isWidget) {
+      message = escapeHTML(message)
       message = message.replace(/\n/g, '<br />')
 
       // Handle HTTP/HTTPS URLs with simple regex
@@ -523,6 +650,178 @@ export default class Chatbot {
     }
 
     return message
+  }
+
+  formatMetricTimestamp(sentAt) {
+    if (typeof sentAt !== 'number' || !Number.isFinite(sentAt)) {
+      return ''
+    }
+
+    const date = new Date(sentAt)
+    const now = new Date()
+
+    if (Number.isNaN(date.getTime()) || Number.isNaN(now.getTime())) {
+      return ''
+    }
+
+    const timeFormatter = new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    })
+    const formattedTime = timeFormatter.format(date)
+    const startOfToday = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate()
+    )
+    const startOfTargetDay = new Date(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate()
+    )
+    const dayDifference = Math.round(
+      (startOfToday.getTime() - startOfTargetDay.getTime()) / 86_400_000
+    )
+
+    if (dayDifference === 0) {
+      return `Today, ${formattedTime}`
+    }
+
+    if (dayDifference === 1) {
+      return `Yesterday, ${formattedTime}`
+    }
+
+    if (dayDifference > 1 && dayDifference < 7) {
+      const weekdayFormatter = new Intl.DateTimeFormat(undefined, {
+        weekday: 'long'
+      })
+
+      return `${weekdayFormatter.format(date)}, ${formattedTime}`
+    }
+
+    const monthDayFormatter = new Intl.DateTimeFormat(undefined, {
+      month: 'short',
+      day: 'numeric'
+    })
+
+    return `${monthDayFormatter.format(date)}, ${formattedTime}`
+  }
+
+  formatFullMetricTimestamp(sentAt) {
+    if (typeof sentAt !== 'number' || !Number.isFinite(sentAt)) {
+      return ''
+    }
+
+    const date = new Date(sentAt)
+
+    if (Number.isNaN(date.getTime())) {
+      return ''
+    }
+
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    const hours = String(date.getHours()).padStart(2, '0')
+    const minutes = String(date.getMinutes()).padStart(2, '0')
+    const seconds = String(date.getSeconds()).padStart(2, '0')
+
+    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`
+  }
+
+  formatTimestampMarkup(sentAt) {
+    const formattedTimestamp = this.formatMetricTimestamp(sentAt)
+    const fullFormattedTimestamp = this.formatFullMetricTimestamp(sentAt)
+
+    if (!formattedTimestamp) {
+      return ''
+    }
+
+    return `
+      <span class="bubble-metric-item">
+        <i class="ri-time-line" aria-hidden="true"></i>
+        <span title="${fullFormattedTimestamp || formattedTimestamp}">${formattedTimestamp}</span>
+      </span>
+    `.trim()
+  }
+
+  formatMetrics(metrics, sentAt = null) {
+    if (!metrics) {
+      return ''
+    }
+
+    const inputTokens = Number(metrics.inputTokens || 0)
+    const outputTokens = Number(metrics.outputTokens || 0)
+    const totalTokens = Number(metrics.totalTokens || inputTokens + outputTokens)
+    const durationSeconds = Number(metrics.durationMs || 0) / 1_000
+    const tokensPerSecond = Number(
+      metrics.tokensPerSecond || metrics.averagedPhaseTokensPerSecond || 0
+    )
+    const tokenFormatter = new Intl.NumberFormat()
+    const timestampMarkup = this.formatTimestampMarkup(sentAt)
+
+    return `
+      <span class="bubble-metric-item">
+        <i class="ri-copper-coin-line" aria-hidden="true"></i>
+        <span>${tokenFormatter.format(totalTokens)} (i:${tokenFormatter.format(inputTokens)}/o:${tokenFormatter.format(outputTokens)}) tok</span>
+      </span>
+      <span class="bubble-metric-item">
+        <i class="ri-timer-flash-line" aria-hidden="true"></i>
+        <span>${durationSeconds.toFixed(1)}s</span>
+      </span>
+      <span class="bubble-metric-item">
+        <i class="ri-flashlight-line" aria-hidden="true"></i>
+        <span>${tokensPerSecond.toFixed(2)} t/s</span>
+      </span>
+      ${timestampMarkup}
+    `.trim()
+  }
+
+  createMetricsElement(metrics, sentAt = null) {
+    const metricsElement = document.createElement('div')
+
+    metricsElement.className = 'bubble-metrics'
+    metricsElement.innerHTML = this.formatMetrics(metrics, sentAt)
+
+    return metricsElement
+  }
+
+  createTimestampElement(sentAt) {
+    const timestampMarkup = this.formatTimestampMarkup(sentAt)
+
+    if (!timestampMarkup) {
+      return null
+    }
+
+    const timestampElement = document.createElement('div')
+
+    timestampElement.className = 'bubble-metrics'
+    timestampElement.innerHTML = timestampMarkup
+
+    return timestampElement
+  }
+
+  updateBubbleMetrics(container, metrics, sentAt = null) {
+    if (!container) {
+      return
+    }
+
+    const existingMetricsElement = container.querySelector('.bubble-metrics')
+
+    if (!metrics) {
+      if (existingMetricsElement) {
+        existingMetricsElement.remove()
+      }
+
+      return
+    }
+
+    if (existingMetricsElement) {
+      existingMetricsElement.innerHTML = this.formatMetrics(metrics, sentAt)
+      return
+    }
+
+    container.appendChild(this.createMetricsElement(metrics, sentAt))
   }
 
   getLatestReasoningContainer() {
@@ -555,17 +854,35 @@ export default class Chatbot {
       }
     }
 
-    const widgetString =
-      typeof newData === 'string' ? newData : JSON.stringify(newData)
+    const isTextAnswerPayload = Boolean(
+      newData &&
+        typeof newData === 'object' &&
+        typeof newData.answer === 'string' &&
+        !newData.widget &&
+        !newData.componentTree
+    )
+    const bubbleString = isTextAnswerPayload
+      ? newData.answer
+      : typeof newData === 'string'
+        ? newData
+        : JSON.stringify(newData)
+    const metrics =
+      isTextAnswerPayload && newData.llmMetrics ? newData.llmMetrics : null
 
+    const shouldSaveMessage = !this.isSystemWidgetData(newData)
     const beforeElement = isPlanWidget ? null : nextSibling
 
     this.createBubble({
       who: 'leon',
-      string: widgetString,
-      save: isPlanWidget,
+      string: bubbleString,
+      save: shouldSaveMessage,
       messageId: replaceMessageId,
-      beforeElement
+      beforeElement,
+      metrics,
+      sentAt:
+        newData && typeof newData === 'object' && typeof newData.sentAt === 'number'
+          ? newData.sentAt
+          : Date.now()
     })
 
     /**

@@ -9,7 +9,6 @@ export default class Client {
   constructor(client, serverUrl, input) {
     this.client = client
     this._input = input
-    this._suggestionContainer = document.querySelector('#suggestions-container')
     this.voiceSpeechElement = document.querySelector('#voice-speech')
     this.serverUrl = serverUrl
     this.socket = io(this.serverUrl)
@@ -24,6 +23,8 @@ export default class Client {
     this._ttsAudioContext = null
     this._isLeonGeneratingAnswer = false
     this._isVoiceModeEnabled = false
+    this._hasSentInitMessages = false
+    this._chatbotInitPromise = null
     // this._ttsAudioContextes = {}
   }
 
@@ -46,12 +47,14 @@ export default class Client {
   }
 
   updateMood(mood) {
-    if (window.leonConfigInfo.llm.enabled) {
-      const moodContainer = document.querySelector('#mood')
+    const moodContainer = document.querySelector('#mood')
 
-      moodContainer.textContent = `Leon's mood: ${mood.emoji}`
-      moodContainer.setAttribute('title', mood.type)
+    if (!moodContainer || !mood?.emoji || !mood?.type) {
+      return
     }
+
+    moodContainer.textContent = `Leon's mood: ${mood.emoji}`
+    moodContainer.setAttribute('title', mood.type)
   }
 
   async sendInitMessages() {
@@ -83,6 +86,34 @@ export default class Client {
     )
   }
 
+  waitForInitUICompletion() {
+    if (this._hasSentInitMessages || this.chatbot.parsedBubbles?.length > 0) {
+      return
+    }
+
+    const trySendInitMessages = () => {
+      const initializedInitElement = document.querySelector('#init .initialized')
+
+      if (!initializedInitElement) {
+        return false
+      }
+
+      this._hasSentInitMessages = true
+      this.sendInitMessages()
+      return true
+    }
+
+    if (trySendInitMessages()) {
+      return
+    }
+
+    const interval = setInterval(() => {
+      if (trySendInitMessages()) {
+        clearInterval(interval)
+      }
+    }, 100)
+  }
+
   asrStartRecording() {
     if (!window.leonConfigInfo.stt.enabled) {
       console.warn('ASR is not enabled')
@@ -99,7 +130,7 @@ export default class Client {
   }
 
   init() {
-    this.chatbot.init()
+    this._chatbotInitPromise = this.chatbot.init()
     this.voiceEnergy.init()
 
     if (window.leonConfigInfo?.tcpServer?.enabled === false) {
@@ -107,7 +138,12 @@ export default class Client {
     }
 
     this.socket.on('connect', () => {
-      this.socket.emit('init', this.client)
+      this.socket.emit('init', {
+        client: this.client,
+        capabilities: {
+          supportsWidgets: true
+        }
+      })
     })
 
     /**
@@ -119,22 +155,19 @@ export default class Client {
     this.socket.on('init-tcp-server-boot', (status) => {
       this.setInitStatus('tcpServerBoot', status)
     })
-    this.socket.on('init-llm', (status) => {
-      this.setInitStatus('llm', status)
-    })
-    this.socket.on('warmup-llm-duties', (status) => {
-      this.setInitStatus('llmDutiesWarmUp', status)
+    this.socket.on('init-llama-server-boot', (status) => {
+      this.setInitStatus('llamaServerBoot', status)
     })
 
     this.socket.on('ready', () => {
-      setTimeout(() => {
-        const body = document.querySelector('body')
-        body.classList.remove('settingup')
-      }, 250)
+      void this._chatbotInitPromise?.then(() => {
+        setTimeout(() => {
+          const body = document.querySelector('body')
+          body.classList.remove('settingup')
+        }, 250)
 
-      if (this.chatbot.parsedBubbles?.length === 0) {
-        this.sendInitMessages()
-      }
+        this.waitForInitUICompletion()
+      })
     })
 
     this.socket.on('answer', (data) => {
@@ -144,6 +177,13 @@ export default class Client {
 
       // Leon has finished to answer
       this._isLeonGeneratingAnswer = false
+
+      const isPlanWidget =
+        data && typeof data === 'object' && data.widget === 'PlanWidget'
+
+      if (isPlanWidget) {
+        this.chatbot.isTyping('leon', false)
+      }
 
       /**
        * Handle message replacement if replaceMessageId is provided
@@ -165,6 +205,7 @@ export default class Client {
        * Handle widget data directly
        */
       if (data.widget || data.componentTree) {
+        const isSystemWidget = this.chatbot.isSystemWidgetData(data)
         // Pass the entire widget data as JSON string for chatbot.js to handle
         const widgetString =
           typeof data === 'string' ? data : JSON.stringify(data)
@@ -172,11 +213,18 @@ export default class Client {
         this.chatbot.createBubble({
           who: 'leon',
           string: widgetString,
+          save: !isSystemWidget,
           messageId: data.widget?.id || data.id || `msg-${Date.now()}`
         })
 
         return
       }
+
+      const answerText = typeof data === 'string' ? data : data.answer
+      const llmMetrics =
+        data && typeof data === 'object' && data.llmMetrics
+          ? data.llmMetrics
+          : null
 
       /**
        * Just save the bubble if the newest bubble is from the streaming.
@@ -192,16 +240,47 @@ export default class Client {
       const isBubbleFromStreaming = Boolean(streamedBubbleContainerElement)
 
       if (isBubbleFromStreaming && streamedBubbleContainerElement) {
-        this.chatbot.saveBubble('leon', data)
+        this.chatbot.saveBubble(
+          'leon',
+          answerText,
+          answerText,
+          null,
+          llmMetrics,
+          data && typeof data === 'object' && typeof data.sentAt === 'number'
+            ? data.sentAt
+            : Date.now()
+        )
 
         // Slightly delay the update to avoid the stream animation to be interrupted
         setTimeout(() => {
           // Update the text of the bubble (quick emoji fix)
           streamedBubbleContainerElement.querySelector('p.bubble').innerHTML =
-            this.chatbot.formatMessage(data)
+            this.chatbot.formatMessage(answerText)
+          this.chatbot.updateBubbleMetrics(
+            streamedBubbleContainerElement,
+            llmMetrics,
+            data && typeof data === 'object' && typeof data.sentAt === 'number'
+              ? data.sentAt
+              : Date.now()
+          )
         }, 2_500)
       } else {
-        this.chatbot.receivedFrom('leon', data)
+        this.chatbot.createBubble({
+          who: 'leon',
+          string: answerText,
+          save:
+            !(
+              data &&
+              typeof data === 'object' &&
+              data.historyMode === 'system_widget'
+            ),
+          metrics: llmMetrics,
+          messageId: data && typeof data === 'object' ? data.messageId : null,
+          sentAt:
+            data && typeof data === 'object' && typeof data.sentAt === 'number'
+              ? data.sentAt
+              : Date.now()
+        })
       }
       this.chatbot.scrollDown({ force: true })
 
@@ -223,6 +302,19 @@ export default class Client {
 
     this.socket.on('is-typing', (data) => {
       this.chatbot.isTyping('leon', data)
+    })
+
+    this.socket.on('owner-utterance', (data) => {
+      if (!data?.utterance) {
+        return
+      }
+
+      this.chatbot.createBubble({
+        who: 'me',
+        string: data.utterance,
+        messageId: data.messageId,
+        sentAt: typeof data.sentAt === 'number' ? data.sentAt : Date.now()
+      })
     })
 
     this.socket.on('recognized', (data, cb) => {
@@ -360,6 +452,10 @@ export default class Client {
 
     this.socket.on('tts-end-of-speech', async () => {
       this.voiceEnergy.status = 'listening'
+
+      if (window.leonConfigInfo?.stt?.enabled) {
+        this.socket.emit('asr-start-record')
+      }
     })
 
     this.socket.on('audio-forwarded', (data, cb) => {
@@ -419,18 +515,15 @@ export default class Client {
     }
 
     if (this._input.value !== '') {
+      const sentAt = Date.now()
+
       this.socket.emit(keyword, {
         client: this.client,
-        value: this._input.value.trim()
+        value: this._input.value.trim(),
+        sentAt
       })
-      this.chatbot.sendTo('leon', this._input.value)
+      this.chatbot.sendTo('leon', this._input.value, sentAt)
       this.chatbot.scrollDown({ force: true })
-
-      this._suggestions.forEach((suggestion) => {
-        // Remove all event listeners of the suggestion
-        suggestion.replaceWith(suggestion.cloneNode(true))
-        this._suggestionContainer.replaceChildren()
-      })
 
       this.save()
 
@@ -465,22 +558,6 @@ export default class Client {
       this._input.value = this._input.value.slice(0, -1)
     }, 0)
   }
-
-  /*addSuggestion(text) {
-    const newSuggestion = document.createElement('button')
-    newSuggestion.classList.add('suggestion')
-    newSuggestion.textContent = text
-
-    this._suggestionContainer.appendChild(newSuggestion)
-
-    newSuggestion.addEventListener('click', (e) => {
-      e.preventDefault()
-      this.input = e.target.textContent
-      this.send('utterance')
-    })
-
-    this._suggestions.push(newSuggestion)
-  }*/
 
   enableVoiceMode() {
     if (!this._isVoiceModeEnabled) {

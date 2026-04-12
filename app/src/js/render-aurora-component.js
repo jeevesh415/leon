@@ -1,5 +1,6 @@
 import { createElement } from 'react'
-import * as auroraComponents from '@leon-ai/aurora'
+
+import * as auroraComponents from '@aurora'
 
 import * as customAuroraComponents from '../custom-aurora-components'
 
@@ -9,11 +10,14 @@ export default function renderAuroraComponent(
   supportedEvents
 ) {
   if (component) {
+    // `import/namespace` cannot statically validate dynamic component lookups.
+    // eslint-disable-next-line import/namespace
     let reactComponent = auroraComponents[component.component]
     /**
      * Find custom component if a former component is not found
      */
     if (!reactComponent) {
+      // eslint-disable-next-line import/namespace
       reactComponent = customAuroraComponents[component.component]
     }
 

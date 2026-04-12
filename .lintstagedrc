@@ -1,3 +1,3 @@
 {
-  "*": ["npm run lint"]
+  "*": ["./bin/pnpm/pnpm run lint"]
 }

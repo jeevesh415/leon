@@ -21,10 +21,21 @@ core/context/private/
 core/memory/*
 !core/memory/.gitkeep
 core/config/**/*.json
+bin/node/*
+!bin/node/versions.json
+bin/pnpm/*
+!bin/pnpm/versions.json
+bin/python/*
+!bin/python/versions.json
+bin/uv/*
+!bin/uv/versions.json
 bin/coqui/*
 bin/flite/*
 bin/nvidia/*
-bin/pytorch/torch/*
+bin/pytorch/torch
+bin/llama.cpp/llama.cpp
+bin/cmake/cmake
+bin/ninja/ninja
 scripts/out/*.md
 
 package-lock.json
@@ -34,7 +45,13 @@ package-lock.json
 npm-debug.log
 debug.log
 .env
-.last-skill-npm-install
+.recently-used-commands
+.last-skill-deps-sync
+.last-nodejs-bridge-deps-sync
+.last-native-node-modules-rebuild
+bridges/python/src/.last-python-bridge-deps-sync
+tcp_server/src/.last-tcp-server-deps-sync
+skills/**/.runtime/
 leon.json
 bridges/python/src/Pipfile.lock
 bridges/toolkits/**/bins

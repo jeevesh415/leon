@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import { LogHelper } from '@/helpers/log-helper'
 import {
   TOOLKIT_REGISTRY,
-  TOOL_EXECUTOR
+  TOOL_EXECUTOR,
+  SOCKET_SERVER
 } from '@/core'
 import type { OpenAITool } from '@/core/llm-manager/types'
 
@@ -32,12 +33,14 @@ import {
   isToolLevel,
   formatExecutionHistory,
   parseOutput,
+  parseStepsFromArgs,
   validateToolInput,
   extractFinalAnswerFromToolResult,
   formatFilePath
 } from './utils'
 import {
   asRecord,
+  buildStepLabelFromFunction,
   normalizeToolInputForComparison,
   extractFailureMessageFromObservation,
   findDuplicateToolInputMatch,
@@ -162,12 +165,144 @@ function buildExecutionContextManifestSection(
   return buildContextManifestSection(caller.getContextManifest())
 }
 
+function buildExecutionReplanFallbackLabel(functionName: string): string {
+  return buildStepLabelFromFunction(functionName)
+}
+
+function stringifyToolPanelValue(value: unknown): string {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) {
+      return '(empty)'
+    }
+
+    try {
+      return JSON.stringify(JSON.parse(trimmed), null, 2)
+    } catch {
+      return trimmed
+    }
+  }
+
+  if (typeof value === 'undefined') {
+    return '(empty)'
+  }
+
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function emitToolExecutionToWebApp(params: {
+  toolkitId: string
+  toolId: string
+  functionName: string
+  toolInput: string
+  output: Record<string, unknown>
+  status: string
+  message: string
+  stepLabel?: string
+}): void {
+  const resolvedTool = TOOLKIT_REGISTRY.resolveToolById(
+    params.toolId,
+    params.toolkitId
+  )
+  const toolkitName = resolvedTool?.toolkitName || params.toolkitId
+  const toolName = resolvedTool?.toolName || params.toolId
+  const toolGroupId =
+    `react_${params.toolkitId}_${params.toolId}_${params.functionName}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+
+  const prefixLines = params.stepLabel
+    ? [`Step: ${params.stepLabel}`, '']
+    : []
+  const inputMessage = [
+    ...prefixLines,
+    'Input:',
+    stringifyToolPanelValue(params.toolInput)
+  ].join('\n')
+  const outputPayload = {
+    status: params.status,
+    message: params.message,
+    output: params.output
+  }
+  const outputMessage = [
+    `Output (${params.status}):`,
+    stringifyToolPanelValue(outputPayload)
+  ].join('\n')
+
+  SOCKET_SERVER.emitAnswerToChatClients({
+    answer: inputMessage,
+    isToolOutput: true,
+    toolDisplayMode: 'activity_card',
+    toolPhase: 'input',
+    toolkitName,
+    toolName,
+    toolGroupId,
+    key: `${params.toolkitId}.${params.toolId}.${params.functionName}`,
+    functionName: params.functionName,
+    toolInput: params.toolInput,
+    ...(params.stepLabel ? { stepLabel: params.stepLabel } : {})
+  })
+  SOCKET_SERVER.emitAnswerToChatClients({
+    answer: outputMessage,
+    isToolOutput: true,
+    toolDisplayMode: 'activity_card',
+    toolPhase: 'output',
+    toolkitName,
+    toolName,
+    toolGroupId,
+    key: `${params.toolkitId}.${params.toolId}.${params.functionName}`,
+    functionName: params.functionName,
+    status: params.status,
+    message: params.message,
+    output: params.output,
+    ...(params.stepLabel ? { stepLabel: params.stepLabel } : {})
+  })
+}
+
+function extractExecutionReplanSteps(
+  parsed: Record<string, unknown>
+): PlanStep[] {
+  if (Array.isArray(parsed['steps'])) {
+    return (parsed['steps'] as Record<string, unknown>[])
+      .filter(
+        (step) =>
+          typeof step['function'] === 'string' &&
+          (step['function'] as string).trim()
+      )
+      .map((step) => {
+        const functionName = (step['function'] as string).trim()
+        const label =
+          typeof step['label'] === 'string' && (step['label'] as string).trim()
+            ? (step['label'] as string).trim()
+            : buildExecutionReplanFallbackLabel(functionName)
+
+        return {
+          function: functionName,
+          label
+        }
+      })
+  }
+
+  if (Array.isArray(parsed['functions'])) {
+    return parseStepsFromArgs(
+      (parsed['functions'] as string[]).map((functionName) => ({
+        function: functionName,
+        label: buildExecutionReplanFallbackLabel(functionName)
+      }))
+    )
+  }
+
+  return []
+}
+
 export async function runExecutionSelfObservationPhase(
   caller: LLMCaller,
   executionHistory: ExecutionRecord[]
 ): Promise<
   | { type: 'handoff', signal: FinalResponseSignal }
-  | { type: 'replan', reason: string, functions: string[] }
+  | { type: 'replan', reason: string, steps: PlanStep[] }
   | null
 > {
   const historySection = formatExecutionHistory(executionHistory)
@@ -180,7 +315,7 @@ Use only the user request and collected observations to decide whether the reque
 <decision_contract>
 - Return ONLY one of:
   - {"type":"handoff","intent":"answer","draft":"..."} when the request is fully completed.
-  - {"type":"replan","functions":["toolkit_id.tool_id.function_name",...],"reason":"..."} when more tool steps are still needed.
+  - {"type":"replan","steps":[{"function":"toolkit_id.tool_id.function_name","label":"Short verb-first label"}],"reason":"..."} when more tool steps are still needed.
 - Treat the task as complete only when every requested deliverable is already satisfied or explicitly blocked by the observations.
 - If any requested artifact, transformation, verification, write step, or follow-up action is still missing, choose "replan".
 - If a read, probe, or discovery step reveals another instruction or subtask to carry out, the task is still incomplete until that revealed instruction is executed or explicitly blocked.
@@ -192,6 +327,7 @@ Use only the user request and collected observations to decide whether the reque
 - If the current best answer would still rely on weak hints or unresolved uncertainty that context or memory could reduce, choose "replan" and add grounding steps instead of handing off an answer.
 - If your best draft would mention a next step, remaining work, or that something still needs to be done, choose "replan" instead of "handoff".
 - For "replan", "reason" must be a short progress update in present progressive form, written in neutral or first-person phrasing, and end with "...". Example: "Checking additional context files...".
+- For "replan", every step label must be a short user-facing action, start with a verb, and stay under 8 words.
 - "draft" should be a concise handoff payload for the final answer phase.
 </decision_contract>`
   const systemPrompt = buildPhaseSystemPrompt(
@@ -229,11 +365,28 @@ Use only the user request and collected observations to decide whether the reque
           { type: 'null' }
         ]
       },
+      steps: {
+        anyOf: [
+          {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                function: { type: 'string' },
+                label: { type: 'string' }
+              },
+              required: ['function', 'label'],
+              additionalProperties: false
+            }
+          },
+          { type: 'null' }
+        ]
+      },
       reason: {
         anyOf: [{ type: 'string' }, { type: 'null' }]
       }
     },
-    required: ['type', 'draft', 'intent', 'functions', 'reason'],
+    required: ['type', 'draft', 'intent', 'functions', 'steps', 'reason'],
     additionalProperties: false
   }
 
@@ -286,9 +439,7 @@ Use only the user request and collected observations to decide whether the reque
     return {
       type: 'replan',
       reason: (parsed['reason'] as string) || 'More steps are needed',
-      functions: Array.isArray(parsed['functions'])
-        ? (parsed['functions'] as string[])
-        : []
+      steps: extractExecutionReplanSteps(parsed)
     }
   }
 
@@ -626,9 +777,7 @@ async function resolveToolFunctionWithNativeTools(
       return {
         type: 'replan',
         reason: (parsed['reason'] as string) || 'Plan revision needed',
-        functions: Array.isArray(parsed['functions'])
-          ? (parsed['functions'] as string[])
-          : []
+        steps: extractExecutionReplanSteps(parsed)
       }
     }
     if (parsed?.['type'] === 'execute') {
@@ -734,6 +883,23 @@ async function resolveToolFunctionWithJSONMode(
           { type: 'null' }
         ]
       },
+      steps: {
+        anyOf: [
+          {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                function: { type: 'string' },
+                label: { type: 'string' }
+              },
+              required: ['function', 'label'],
+              additionalProperties: false
+            }
+          },
+          { type: 'null' }
+        ]
+      },
       reason: {
         anyOf: [{ type: 'string' }, { type: 'null' }]
       },
@@ -755,6 +921,7 @@ async function resolveToolFunctionWithJSONMode(
       'function_name',
       'tool_input',
       'functions',
+      'steps',
       'reason',
       'draft',
       'intent'
@@ -822,9 +989,7 @@ async function resolveToolFunctionWithJSONMode(
     return {
       type: 'replan',
       reason: (parsed['reason'] as string) || 'Plan revision needed',
-      functions: Array.isArray(parsed['functions'])
-        ? (parsed['functions'] as string[])
-        : []
+      steps: extractExecutionReplanSteps(parsed)
     }
   }
 
@@ -1045,7 +1210,7 @@ async function executeFunctionWithNativeTools(
       prompt,
       executeSystemPrompt,
       [tool],
-      { type: 'function', function: { name: functionName } },
+      'auto',
       undefined,
       false,
       buildExecutionPromptSections({
@@ -1135,9 +1300,7 @@ async function executeFunctionWithNativeTools(
         return {
           type: 'replan',
           reason: (parsed['reason'] as string) || 'Plan revision needed',
-          functions: Array.isArray(parsed['functions'])
-            ? (parsed['functions'] as string[])
-            : []
+          steps: extractExecutionReplanSteps(parsed)
         }
       }
       if (parsed?.['type'] === 'execute') {
@@ -1353,9 +1516,7 @@ async function executeFunctionWithJSONMode(
       return {
         type: 'replan',
         reason: (parsed['reason'] as string) || 'Plan revision needed',
-        functions: Array.isArray(parsed['functions'])
-          ? (parsed['functions'] as string[])
-          : []
+        steps: extractExecutionReplanSteps(parsed)
       }
     }
 
@@ -1575,6 +1736,17 @@ export async function runToolExecution(
   LogHelper.debug(
     `Tool output: ${JSON.stringify(toolExecutionResult.data?.output)}`
   )
+
+  emitToolExecutionToWebApp({
+    toolkitId,
+    toolId,
+    functionName,
+    toolInput: requestedToolInput,
+    output: toolExecutionResult.data?.output || {},
+    status: effectiveStatus,
+    message: effectiveMessage,
+    ...(stepLabel ? { stepLabel } : {})
+  })
 
   // Check for final_answer in tool result
   const finalAnswer =

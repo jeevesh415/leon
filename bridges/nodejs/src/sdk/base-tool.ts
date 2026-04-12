@@ -4,9 +4,16 @@ import os from 'node:os'
 import { spawn, execSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
-import { downloadFile } from 'ipull'
+import {
+  NetworkHelper,
+  type DownloadFileProgress
+} from '@/helpers/network-helper'
 
-import { TOOLKITS_PATH } from '@bridge/constants'
+import {
+  NVIDIA_LIBS_PATH,
+  PYTORCH_TORCH_PATH,
+  TOOLKITS_PATH
+} from '@bridge/constants'
 import { ToolkitConfig } from '@sdk/toolkit-config'
 import { reportToolOutput } from '@sdk/tool-reporter'
 import {
@@ -55,6 +62,19 @@ export abstract class Tool {
     }
     return args[runtimeIndex + 1] === 'tool'
   })()
+
+  private static readonly nvidiaLibraryFolders = [
+    'cublas',
+    'cudnn',
+    'cuda_cudart',
+    'cuda_cupti',
+    'cusparse',
+    'cusparselt',
+    'cusparse_full',
+    'nccl',
+    'nvshmem',
+    'nvjitlink'
+  ]
 
   /**
    * Tool settings loaded from toolkit settings.json
@@ -297,6 +317,7 @@ export abstract class Tool {
   ): string {
     try {
       const startTime = Date.now()
+      const env = this.getBundledLibraryEnv()
 
       const result = execSync(
         `"${binaryPath}" ${args
@@ -305,7 +326,8 @@ export abstract class Tool {
         {
           encoding: execOptions.encoding || 'utf8',
           timeout: execOptions.timeout,
-          cwd: execOptions.cwd
+          cwd: execOptions.cwd,
+          env
         }
       )
 
@@ -361,9 +383,11 @@ export abstract class Tool {
     return new Promise((resolve, reject) => {
       const startTime = Date.now()
       let outputBuffer = ''
+      const env = this.getBundledLibraryEnv()
 
       const childProcess = spawn(binaryPath, args, {
-        cwd: execOptions.cwd
+        cwd: execOptions.cwd,
+        env
       })
 
       // Handle stdout
@@ -466,6 +490,39 @@ export abstract class Tool {
         }, execOptions.timeout)
       }
     })
+  }
+
+  private getBundledLibraryEnv(): NodeJS.ProcessEnv {
+    const env = { ...process.env }
+    const sharedLibraryPaths = this.getBundledLibraryPaths()
+
+    if (sharedLibraryPaths.length === 0) {
+      return env
+    }
+
+    const envKey =
+      process.platform === 'win32'
+        ? 'PATH'
+        : process.platform === 'darwin'
+          ? 'DYLD_LIBRARY_PATH'
+          : 'LD_LIBRARY_PATH'
+    const existingValue = env[envKey]
+
+    env[envKey] = [...sharedLibraryPaths, existingValue]
+      .filter(Boolean)
+      .join(path.delimiter)
+
+    return env
+  }
+
+  private getBundledLibraryPaths(): string[] {
+    const bundledPaths = [path.join(PYTORCH_TORCH_PATH, 'torch', 'lib')]
+
+    for (const folderName of Tool.nvidiaLibraryFolders) {
+      bundledPaths.push(path.join(NVIDIA_LIBS_PATH, folderName, 'lib'))
+    }
+
+    return bundledPaths.filter((candidate) => fs.existsSync(candidate))
   }
 
   /**
@@ -661,17 +718,12 @@ export abstract class Tool {
 
       try {
         await fs.promises.mkdir(path.dirname(filePath), { recursive: true })
-        const engine = await downloadFile({
-          url: adjustedUrl,
-          savePath: filePath,
+        await NetworkHelper.downloadFile(adjustedUrl, filePath, {
           cliProgress: false,
           parallelStreams: 3,
-          skipExisting: false
+          skipExisting: false,
+          onProgress: this.createDownloadProgressListener(fileName)
         })
-
-        this.listenDownloadProgress(engine, fileName)
-
-        await engine.download()
 
         await this.report('bridges.tools.resource_file_downloaded', {
           resource_name: resourceName,
@@ -1067,7 +1119,7 @@ export abstract class Tool {
   }
 
   /**
-   * Download binary from URL using ipull (faster parallel downloader)
+   * Download binary from URL using the core download helper.
    * If the downloaded file is an archive, it will be extracted automatically
    */
   private async downloadBinary(url: string, outputPath: string): Promise<void> {
@@ -1093,19 +1145,14 @@ export abstract class Tool {
         downloadPath = outputPath + archiveExt
       }
 
-      // Download the file directly to the download path using ipull
-      const engine = await downloadFile({
-        url: url,
-        savePath: downloadPath,
+      await NetworkHelper.downloadFile(url, downloadPath, {
         cliProgress: false,
         parallelStreams: 3,
-        skipExisting: false
+        skipExisting: false,
+        onProgress: this.createDownloadProgressListener(
+          path.basename(downloadPath)
+        )
       })
-
-      this.listenDownloadProgress(engine, path.basename(downloadPath))
-
-      // Actually start the download
-      await engine.download()
 
       // If it's an archive, extract it
       if (isArchiveDownload) {
@@ -1194,87 +1241,74 @@ export abstract class Tool {
   }
 
   /**
-   * Setup progress tracking for a download engine if cliProgress is enabled
-   * @param engine The download engine from ipull
+   * Create a throttled progress listener for a download.
    * @param fileName The name of the file being downloaded
    */
-  private listenDownloadProgress(
-    engine: {
-      on: (event: string, callback: (progress: unknown) => void) => void
-    },
+  private createDownloadProgressListener(
     fileName: string
-  ): void {
-    if (this.cliProgress) {
-      let lastLoggedPercentage = -1
-      let lastLogTime = 0
-      const LOG_INTERVAL_MS = 2_000 // Log every 2 seconds at most
-      const PERCENTAGE_THRESHOLD = 5 // Log every 5% progress
+  ): (progress: DownloadFileProgress) => void {
+    if (!this.cliProgress) {
+      return (): void => {}
+    }
 
-      engine.on('progress', (progress: unknown) => {
-        if (progress && typeof progress === 'object' && progress !== null) {
-          const progressObj = progress as {
-            percentage?: number
-            speed?: string | number
-            eta?: string | number
-            size?: string | number
-            transferred?: string | number
-          }
+    let lastLoggedPercentage = -1
+    let lastLogTime = 0
+    const LOG_INTERVAL_MS = 2_000 // Log every 2 seconds at most
+    const PERCENTAGE_THRESHOLD = 5 // Log every 5% progress
 
-          const percentage = Math.round(progressObj.percentage || 0)
-          const currentTime = Date.now()
+    return (progress: DownloadFileProgress): void => {
+      const percentage = Math.round(progress.percentage ?? 0)
+      const currentTime = Date.now()
 
-          // Only log if we've made significant progress or enough time has passed
-          const shouldLog =
-            percentage >= lastLoggedPercentage + PERCENTAGE_THRESHOLD ||
-            currentTime - lastLogTime >= LOG_INTERVAL_MS ||
-            percentage === 100
+      // Only log if we've made significant progress or enough time has passed
+      const shouldLog =
+        percentage >= lastLoggedPercentage + PERCENTAGE_THRESHOLD ||
+        currentTime - lastLogTime >= LOG_INTERVAL_MS ||
+        percentage === 100
 
-          if (shouldLog) {
-            const speed = progressObj.speed
-              ? formatSpeed(progressObj.speed)
-              : ''
-            const eta = progressObj.eta ? formatETA(progressObj.eta) : ''
+      if (!shouldLog) {
+        return
+      }
 
-            // Build progress line
-            let progressLine = `Downloading ${fileName}: ${percentage}%`
+      const speed =
+        progress.bytesPerSecond > 0
+          ? formatSpeed(progress.bytesPerSecond)
+          : ''
+      const eta =
+        progress.etaMs !== null ? formatETA(progress.etaMs / 1_000) : ''
 
-            if (speed) {
-              progressLine += ` at ${speed}`
-            }
+      let progressLine = `Downloading ${fileName}`
 
-            if (eta && eta !== '∞') {
-              progressLine += ` (ETA: ${eta})`
-            }
+      if (progress.percentage !== null) {
+        progressLine += `: ${percentage}%`
+      }
 
-            if (progressObj.size && progressObj.transferred) {
-              const totalSize = formatBytes(
-                typeof progressObj.size === 'string'
-                  ? parseFloat(progressObj.size)
-                  : progressObj.size
-              )
-              const transferredSize = formatBytes(
-                typeof progressObj.transferred === 'string'
-                  ? parseFloat(progressObj.transferred)
-                  : progressObj.transferred
-              )
-              progressLine += ` [${transferredSize}/${totalSize}]`
-            }
+      if (speed) {
+        progressLine += ` at ${speed}`
+      }
 
-            this.log(progressLine)
+      if (eta && eta !== '∞') {
+        progressLine += ` (ETA: ${eta})`
+      }
 
-            lastLoggedPercentage = percentage
-            lastLogTime = currentTime
-          }
-        }
-      })
+      if (
+        progress.totalBytes !== null &&
+        progress.downloadedBytes <= progress.totalBytes
+      ) {
+        progressLine += ` [${formatBytes(progress.downloadedBytes)}/${formatBytes(progress.totalBytes)}]`
+      }
 
-      // Log completion
-      const logCompletion = (): void => {
+      this.log(progressLine)
+
+      if (
+        progress.totalBytes !== null &&
+        progress.downloadedBytes === progress.totalBytes
+      ) {
         this.log(`Download completed: ${fileName}`)
       }
 
-      engine.on('finished', logCompletion)
-      engine.on('end', logCompletion)
+      lastLoggedPercentage = percentage
+      lastLogTime = currentTime
     }
   }
 

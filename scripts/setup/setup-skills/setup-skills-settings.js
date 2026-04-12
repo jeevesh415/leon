@@ -1,10 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { commandSync } from 'execa'
-
-import { LogHelper } from '@/helpers/log-helper'
-
 /**
  * Set up skills settings
  */
@@ -32,37 +28,29 @@ export default async function (skillFriendlyName, currentSkill) {
         for (let j = 0; j < settingsSampleKeys.length; j += 1) {
           // Check if the current settings key does not exist
           if (!settingsKeys.includes(settingsSampleKeys[j])) {
-            LogHelper.info(
-              `Adding new settings key "${settingsSampleKeys[j]}" for the ${skillFriendlyName} skill...`
-            )
-
             // Prepare to inject the new settings key object
             const configKey = {
               [settingsSampleKeys[j]]: settingsSample[settingsSampleKeys[j]]
             }
 
             try {
-              // Add new skill settings in the settings.json file
-              commandSync(
-                `json -I -f ${settingsPath} -e 'this.${
-                  settingsSampleKeys[j]
-                }=${JSON.stringify(configKey[settingsSampleKeys[j]])}'`,
-                { shell: true }
-              )
-              LogHelper.success(
-                `"${settingsSampleKeys[j]}" settings key added to ${settingsPath}`
-              )
+              settings[settingsSampleKeys[j]] = configKey[settingsSampleKeys[j]]
             } catch (e) {
-              LogHelper.error(
+              throw new Error(
                 `Error while adding "${settingsSampleKeys[j]}" settings key to ${settingsPath}: ${e}`
               )
             }
           }
         }
+
+        await fs.promises.writeFile(
+          settingsPath,
+          `${JSON.stringify(settings, null, 2)}\n`
+        )
       }
     } else if (!fs.existsSync(settingsSamplePath)) {
       // Stop the setup if the settings.sample.json of the current skill does not exist
-      LogHelper.error(
+      throw new Error(
         `The "${skillFriendlyName}" skill settings file does not exist. Try to pull the project (git pull)`
       )
     } else {
@@ -70,8 +58,6 @@ export default async function (skillFriendlyName, currentSkill) {
       fs.createReadStream(settingsSamplePath).pipe(
         fs.createWriteStream(`${skillSrcPath}/settings.json`)
       )
-
-      LogHelper.success(`"${skillFriendlyName}" skill settings file created`)
     }
   }
 }

@@ -9,8 +9,9 @@ import {
   MEMORY_DB_PATH,
   MEMORY_PATH
 } from '@/constants'
-import { LLMDuties } from '@/core/llm-manager/types'
+import { LLMDuties, LLMProviders } from '@/core/llm-manager/types'
 import { LogHelper } from '@/helpers/log-helper'
+import { CONFIG_STATE } from '@/core/config-states/config-state'
 
 import MemoryRepository from './memory-repository'
 import QMDBackend from './qmd-backend'
@@ -1240,7 +1241,7 @@ Leon: ${normalizedAssistantMessage}
 
 Extract only durable personal memories worth persisting long-term.
 Keep only stable user facts/preferences/commitments likely useful in future conversations.
-Do not include transient chat content.
+Do not include temporary chat content.
 Return strictly valid JSON with this exact shape:
 {"items":[{"content":"..."}]}
 No markdown. No explanation.`
@@ -1248,15 +1249,22 @@ No markdown. No explanation.`
     try {
       const { LLM_PROVIDER } = await import('@/core')
       const completion = await LLM_PROVIDER.prompt(prompt, {
-        dutyType: LLMDuties.Custom,
+        dutyType: LLMDuties.Inference,
         systemPrompt:
           'Extract stable long-term user memory candidates. Be strict and concise.',
         data: EXTRACT_PERSISTENT_MEMORY_SCHEMA,
         timeout: PERSISTENT_EXTRACTION_TIMEOUT_MS,
         maxRetries: PERSISTENT_EXTRACTION_MAX_RETRIES,
         maxTokens: PERSISTENT_EXTRACTION_MAX_TOKENS,
-        disableThinking: true,
-        trackProviderErrors: false
+        trackProviderErrors: false,
+        /**
+         * Disable thinking when Llama.cpp since local models tend
+         * to loop overthink
+         */
+        ...(CONFIG_STATE.getModelState().getWorkflowProvider() ===
+        LLMProviders.LlamaCPP
+          ? { disableThinking: true }
+          : {})
       })
 
       if (!completion?.output) {
@@ -1372,7 +1380,8 @@ No markdown. No explanation.`
       parseConversationPair(entry.content).map((parsed) => ({
         who: parsed.who,
         message: parsed.message,
-        sentAt: Date.now()
+        sentAt: Date.now(),
+        isAddedToHistory: true
       }))
     )
 

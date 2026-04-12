@@ -46,6 +46,7 @@ You may use only the tools and functions listed in the provided catalog.
 - Use context files for environment, runtime, workspace, browser, network, and system facts.
 - Ask a clarification only when the relevant retrieval path still cannot resolve the missing info.
 - Keep clarification minimal: one concise question with only missing essentials.
+- If the request depends on an ungrounded subjective choice or ambiguous target, especially for external or irreversible actions, return type="final" with intent="clarification" immediately instead of assuming or oscillating.
 - Be proactive but avoid unnecessary clarification turns.
 - When a Leon Self-Model Snapshot is provided, use it to maintain continuity, preserve durable owner-tailored behavioral habits, and spot safe optional initiative, but never let it override the current user request.
 - When a Context File is provided, treat it as authoritative evidence of what runtime grounding is available before asking questions about the environment.
@@ -108,8 +109,9 @@ You are executing one specific step. You are given the current function signatur
 - tool_input must be a JSON string.
 - Return ONLY one of the following JSON shapes:
   - {"type":"execute","function_name":"...","tool_input":"{...}"}
-  - {"type":"replan","functions":["toolkit_id.tool_id.function_name",...],"reason":"..."}
+  - {"type":"replan","steps":[{"function":"toolkit_id.tool_id.function_name","label":"Short verb-first label"}],"reason":"..."}
   - {"type":"handoff","intent":"answer|clarification|cancelled|error","draft":"..."}
+- For "replan", every step label must be a short user-facing action, start with a verb, and stay under 8 words.
 - No other keys, no null values.
 </output_contract>`
 
@@ -137,8 +139,9 @@ You are given the available functions for one tool. Choose the single most appro
 - tool_input must be a JSON string.
 - Return ONLY one of the following JSON shapes:
   - {"type":"execute","function_name":"...","tool_input":"{...}"}
-  - {"type":"replan","functions":["toolkit_id.tool_id.function_name",...],"reason":"..."}
+  - {"type":"replan","steps":[{"function":"toolkit_id.tool_id.function_name","label":"Short verb-first label"}],"reason":"..."}
   - {"type":"handoff","intent":"answer|clarification|cancelled|error","draft":"..."}
+- For "replan", every step label must be a short user-facing action, start with a verb, and stay under 8 words.
 - No other keys, no null values.
 </output_contract>`
 
@@ -207,7 +210,7 @@ export const PLANNING_WAIT_NOTICE_DELAY_MS = 1_500
 
 export const REACT_HISTORY_COMPACTION_MAX_TOKENS = 512
 export const REACT_HISTORY_COMPACTION_RETRY_MAX_TOKENS = 1_024
-export const REACT_LOCAL_PROVIDER_HISTORY_LOGS = 16
-export const REACT_LOCAL_PROVIDER_HISTORY_COMPACTION_POINT = 12
-export const REACT_REMOTE_PROVIDER_HISTORY_LOGS = 32
-export const REACT_REMOTE_PROVIDER_HISTORY_COMPACTION_POINT = 24
+export const REACT_LOCAL_PROVIDER_HISTORY_LOGS = 24
+export const REACT_LOCAL_PROVIDER_HISTORY_COMPACTION_POINT = 18
+export const REACT_REMOTE_PROVIDER_HISTORY_LOGS = 48
+export const REACT_REMOTE_PROVIDER_HISTORY_COMPACTION_POINT = 36

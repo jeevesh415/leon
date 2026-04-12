@@ -4,7 +4,12 @@ import fs from 'node:fs'
 import dotenv from 'dotenv'
 
 import type { LongLanguageCode } from '@/types'
+import { RuntimeHelper } from '@/helpers/runtime-helper'
 import { SystemHelper } from '@/helpers/system-helper'
+import {
+  getInstalledLLMMetadata,
+  resolveConfiguredLLMTarget
+} from '@/core/llm-manager/llm-routing'
 
 dotenv.config()
 
@@ -31,6 +36,10 @@ export const IS_TESTING_ENV = LEON_NODE_ENV === TESTING_ENV
  * Paths
  */
 export const BIN_PATH = path.join(process.cwd(), 'bin')
+export const NODE_INSTALL_PATH = path.join(BIN_PATH, 'node')
+export const PNPM_INSTALL_PATH = path.join(BIN_PATH, 'pnpm')
+export const PYTHON_INSTALL_PATH = path.join(BIN_PATH, 'python')
+export const UV_INSTALL_PATH = path.join(BIN_PATH, 'uv')
 export const LOGS_PATH = path.join(process.cwd(), 'logs')
 export const SKILLS_PATH = path.join(process.cwd(), 'skills')
 export const GLOBAL_CORE_PATH = path.join(process.cwd(), 'core')
@@ -53,6 +62,10 @@ export const SERVER_PATH = path.join(
 export const TMP_PATH = path.join(SERVER_PATH, 'tmp')
 export const SERVER_CORE_PATH = path.join(SERVER_PATH, 'core')
 export const LEON_FILE_PATH = path.join(process.cwd(), 'leon.json')
+export const RECENTLY_USED_COMMANDS_FILE_PATH = path.join(
+  process.cwd(),
+  '.recently-used-commands'
+)
 
 /**
  * NVIDIA paths and versions.
@@ -65,7 +78,16 @@ export const LEON_FILE_PATH = path.join(process.cwd(), 'leon.json')
 export const NVIDIA_LIBS_PATH = path.join(BIN_PATH, 'nvidia')
 export const NVIDIA_CUBLAS_PATH = path.join(NVIDIA_LIBS_PATH, 'cublas')
 export const NVIDIA_CUDNN_PATH = path.join(NVIDIA_LIBS_PATH, 'cudnn')
+export const NVIDIA_CUDA_CUDART_PATH = path.join(
+  NVIDIA_LIBS_PATH,
+  'cuda_cudart'
+)
+export const NVIDIA_CUDA_CUPTI_PATH = path.join(
+  NVIDIA_LIBS_PATH,
+  'cuda_cupti'
+)
 export const NVIDIA_CUSPARSE_PATH = path.join(NVIDIA_LIBS_PATH, 'cusparse')
+export const NVIDIA_CUSPARSELT_PATH = path.join(NVIDIA_LIBS_PATH, 'cusparselt')
 export const NVIDIA_CUSPARSE_FULL_PATH = path.join(
   NVIDIA_LIBS_PATH,
   'cusparse_full'
@@ -80,6 +102,14 @@ export const NVIDIA_CUBLAS_MANIFEST_PATH = path.join(
 )
 export const NVIDIA_CUDNN_MANIFEST_PATH = path.join(
   NVIDIA_CUDNN_PATH,
+  'manifest.json'
+)
+export const NVIDIA_CUDA_CUDART_MANIFEST_PATH = path.join(
+  NVIDIA_CUDA_CUDART_PATH,
+  'manifest.json'
+)
+export const NVIDIA_CUDA_CUPTI_MANIFEST_PATH = path.join(
+  NVIDIA_CUDA_CUPTI_PATH,
   'manifest.json'
 )
 export const NVIDIA_CUSPARSE_MANIFEST_PATH = path.join(
@@ -108,6 +138,8 @@ const NVIDIA_VERSIONS = JSON.parse(
 export const NVIDIA_CUDA_VERSION = NVIDIA_VERSIONS.cuda
 export const NVIDIA_CUDNN_VERSION = NVIDIA_VERSIONS.cudnn
 export const NVIDIA_CUBLAS_VERSION = NVIDIA_VERSIONS.cublas
+export const NVIDIA_CUDA_CUDART_VERSION = NVIDIA_VERSIONS.cuda_cudart
+export const NVIDIA_CUDA_CUPTI_VERSION = NVIDIA_VERSIONS.cuda_cupti
 export const NVIDIA_CUSPARSE_VERSION = NVIDIA_VERSIONS.cusparse
 export const NVIDIA_CUSPARSE_FULL_VERSION = NVIDIA_VERSIONS.cusparse_full
 export const NVIDIA_NCCL_VERSION = NVIDIA_VERSIONS.nccl
@@ -115,11 +147,95 @@ export const NVIDIA_NVSHMEM_VERSION = NVIDIA_VERSIONS.nvshmem
 export const NVIDIA_NVJITLINK_VERSION = NVIDIA_VERSIONS.nvjitlink
 
 /**
+ * CMake paths and versions.
+ * Used as a common layer across tools.
+ */
+export const CMAKE_PATH = path.join(BIN_PATH, 'cmake')
+export const CMAKE_VERSIONS_PATH = path.join(CMAKE_PATH, 'versions.json')
+export const CMAKE_INSTALL_PATH = path.join(CMAKE_PATH, 'cmake')
+export const CMAKE_MANIFEST_PATH = path.join(CMAKE_INSTALL_PATH, 'manifest.json')
+const CMAKE_VERSIONS = JSON.parse(fs.readFileSync(CMAKE_VERSIONS_PATH, 'utf8'))
+export const CMAKE_VERSION = CMAKE_VERSIONS.cmake
+export const CMAKE_BIN_PATH = path.join(CMAKE_INSTALL_PATH, 'bin', 'cmake')
+
+/**
+ * Ninja paths and versions.
+ * Used as a common layer across tools.
+ */
+export const NINJA_PATH = path.join(BIN_PATH, 'ninja')
+export const NINJA_VERSIONS_PATH = path.join(NINJA_PATH, 'versions.json')
+export const NINJA_INSTALL_PATH = path.join(NINJA_PATH, 'ninja')
+export const NINJA_MANIFEST_PATH = path.join(NINJA_INSTALL_PATH, 'manifest.json')
+const NINJA_VERSIONS = JSON.parse(fs.readFileSync(NINJA_VERSIONS_PATH, 'utf8'))
+export const NINJA_VERSION = NINJA_VERSIONS.ninja
+export const NINJA_BIN_PATH = path.join(NINJA_INSTALL_PATH, 'ninja')
+
+/**
+ * Portable runtime paths and versions.
+ * Used as a common layer across skills, bridges and setup scripts.
+ */
+export const NODE_VERSIONS_PATH = path.join(NODE_INSTALL_PATH, 'versions.json')
+export const NODE_MANIFEST_PATH = path.join(NODE_INSTALL_PATH, 'manifest.json')
+const NODE_VERSIONS = JSON.parse(fs.readFileSync(NODE_VERSIONS_PATH, 'utf8'))
+export const NODE_VERSION = NODE_VERSIONS.node
+
+export const PNPM_VERSIONS_PATH = path.join(PNPM_INSTALL_PATH, 'versions.json')
+export const PNPM_MANIFEST_PATH = path.join(PNPM_INSTALL_PATH, 'manifest.json')
+const PNPM_VERSIONS = JSON.parse(fs.readFileSync(PNPM_VERSIONS_PATH, 'utf8'))
+export const PNPM_VERSION = PNPM_VERSIONS.pnpm
+
+export const PYTHON_VERSIONS_PATH = path.join(
+  PYTHON_INSTALL_PATH,
+  'versions.json'
+)
+export const PYTHON_MANIFEST_PATH = path.join(
+  PYTHON_INSTALL_PATH,
+  'manifest.json'
+)
+const PYTHON_VERSIONS = JSON.parse(
+  fs.readFileSync(PYTHON_VERSIONS_PATH, 'utf8')
+)
+export const PYTHON_VERSION = PYTHON_VERSIONS.python
+
+export const UV_VERSIONS_PATH = path.join(UV_INSTALL_PATH, 'versions.json')
+export const UV_MANIFEST_PATH = path.join(UV_INSTALL_PATH, 'manifest.json')
+const UV_VERSIONS = JSON.parse(fs.readFileSync(UV_VERSIONS_PATH, 'utf8'))
+export const UV_VERSION = UV_VERSIONS.uv
+
+/**
+ * llama.cpp paths and versions.
+ * Used as a common layer across tools.
+ */
+export const LLAMACPP_PATH = path.join(BIN_PATH, 'llama.cpp')
+export const LLAMACPP_VERSIONS_PATH = path.join(LLAMACPP_PATH, 'versions.json')
+export const LLAMACPP_BUILD_PATH = path.join(LLAMACPP_PATH, 'build')
+export const LLAMACPP_SOURCE_PATH = path.join(LLAMACPP_PATH, 'llama.cpp')
+export const LLAMACPP_SOURCE_BUILD_PATH = path.join(
+  LLAMACPP_SOURCE_PATH,
+  'build',
+  'bin'
+)
+export const LLAMACPP_ROOT_MANIFEST_PATH = path.join(LLAMACPP_PATH, 'manifest.json')
+export const LLAMACPP_BUILD_MANIFEST_PATH = path.join(
+  LLAMACPP_BUILD_PATH,
+  'manifest.json'
+)
+export const LLAMACPP_SOURCE_MANIFEST_PATH = path.join(
+  LLAMACPP_SOURCE_PATH,
+  'manifest.json'
+)
+const LLAMACPP_VERSIONS = JSON.parse(
+  fs.readFileSync(LLAMACPP_VERSIONS_PATH, 'utf8')
+)
+export const LLAMACPP_RELEASE_VERSION = LLAMACPP_VERSIONS['llama.cpp']
+
+/**
  * PyTorch paths and versions.
  * Used as a common layer across tools
  */
 export const PYTORCH_PATH = path.join(BIN_PATH, 'pytorch')
 export const PYTORCH_TORCH_PATH = path.join(PYTORCH_PATH, 'torch')
+export const PYTORCH_NVIDIA_PATH = path.join(PYTORCH_TORCH_PATH, 'nvidia')
 export const PYTORCH_VERSIONS_PATH = path.join(PYTORCH_PATH, 'versions.json')
 export const PYTORCH_MANIFEST_PATH = path.join(
   PYTORCH_TORCH_PATH,
@@ -143,27 +259,15 @@ export const PYTHON_TCP_SERVER_ROOT_PATH = path.join(
   'tcp_server'
 )
 
-export const NODEJS_BRIDGE_DIST_PATH = path.join(
-  NODEJS_BRIDGE_ROOT_PATH,
-  'dist'
-)
-export const PYTHON_BRIDGE_DIST_PATH = path.join(
-  PYTHON_BRIDGE_ROOT_PATH,
-  'dist'
-)
-export const PYTHON_TCP_SERVER_DIST_PATH = path.join(
-  PYTHON_TCP_SERVER_ROOT_PATH,
-  'dist'
-)
+/**
+ * Leon now prefers source entrypoints plus managed runtimes so the same setup
+ * can work in development, source installs, and future desktop packaging.
+ */
 
 export const NODEJS_BRIDGE_SRC_PATH = path.join(NODEJS_BRIDGE_ROOT_PATH, 'src')
 export const NODEJS_BRIDGE_TOOL_RUNTIME_SRC_PATH = path.join(
   NODEJS_BRIDGE_SRC_PATH,
   'tool-runtime.ts'
-)
-export const NODEJS_BRIDGE_TOOL_RUNTIME_DIST_PATH = path.join(
-  NODEJS_BRIDGE_DIST_PATH,
-  'tool-runtime.js'
 )
 export const PYTHON_BRIDGE_SRC_PATH = path.join(PYTHON_BRIDGE_ROOT_PATH, 'src')
 export const PYTHON_TCP_SERVER_SRC_PATH = path.join(
@@ -229,27 +333,19 @@ export const [, PYTHON_TCP_SERVER_VERSION] = fs
   .readFileSync(PYTHON_TCP_SERVER_VERSION_FILE_PATH, 'utf8')
   .split('\'')
 
-export const NODEJS_BRIDGE_BIN_NAME = 'leon-nodejs-bridge.cjs'
-export const PYTHON_BRIDGE_BIN_NAME = 'leon-python-bridge'
-export const PYTHON_TCP_SERVER_BIN_NAME = 'leon-tcp-server'
-
-export const PYTHON_TCP_SERVER_BIN_PATH = path.join(
-  PYTHON_TCP_SERVER_DIST_PATH,
-  BINARIES_FOLDER_NAME,
-  PYTHON_TCP_SERVER_BIN_NAME
+export const NODEJS_BRIDGE_ENTRY_PATH = path.join(
+  NODEJS_BRIDGE_ROOT_PATH,
+  'src',
+  'main.ts'
 )
-export const PYTHON_BRIDGE_BIN_PATH = path.join(
-  PYTHON_BRIDGE_DIST_PATH,
-  BINARIES_FOLDER_NAME,
-  PYTHON_BRIDGE_BIN_NAME
+export const PYTHON_BRIDGE_ENTRY_PATH = path.join(
+  PYTHON_BRIDGE_SRC_PATH,
+  'main.py'
 )
-export const NODEJS_BRIDGE_BIN_PATH = `${path.join(
-  process.cwd(),
-  'node_modules',
-  'tsx',
-  'dist',
-  'cli.mjs'
-)} ${path.join(NODEJS_BRIDGE_DIST_PATH, 'bin', NODEJS_BRIDGE_BIN_NAME)}`
+export const PYTHON_TCP_SERVER_ENTRY_PATH = path.join(
+  PYTHON_TCP_SERVER_SRC_PATH,
+  'main.py'
+)
 export const TSX_CLI_PATH = path.join(
   process.cwd(),
   'node_modules',
@@ -257,17 +353,16 @@ export const TSX_CLI_PATH = path.join(
   'dist',
   'cli.mjs'
 )
+export const NODE_RUNTIME_BIN_PATH = RuntimeHelper.getNodeBinPath()
+export const PNPM_RUNTIME_BIN_PATH = RuntimeHelper.getPNPMBinPath()
+export const PYTHON_RUNTIME_BIN_PATH = RuntimeHelper.getPythonBinPath()
+export const UV_RUNTIME_BIN_PATH = RuntimeHelper.getUVBinPath()
+export const PYTHON_BRIDGE_RUNTIME_BIN_PATH =
+  RuntimeHelper.resolveProjectPythonBinPath(PYTHON_BRIDGE_SRC_PATH)
+export const PYTHON_TCP_SERVER_RUNTIME_BIN_PATH =
+  RuntimeHelper.resolveProjectPythonBinPath(PYTHON_TCP_SERVER_SRC_PATH)
 
 export const LEON_VERSION = process.env['npm_package_version']
-
-/**
- * spaCy models
- * @see Find new spaCy models: https://github.com/explosion/spacy-models/releases
- */
-export const EN_SPACY_MODEL_NAME = 'en_core_web_trf'
-export const EN_SPACY_MODEL_VERSION = '3.4.0'
-export const FR_SPACY_MODEL_NAME = 'fr_core_news_md'
-export const FR_SPACY_MODEL_VERSION = '3.4.0'
 
 /**
  * Leon environment preferences
@@ -286,8 +381,6 @@ export const STT_PROVIDER = process.env['LEON_STT_PROVIDER']
 export const HAS_TTS = process.env['LEON_TTS'] === 'true'
 export const TTS_PROVIDER = process.env['LEON_TTS_PROVIDER']
 
-export const HAS_WARM_UP_LLM_DUTIES =
-  process.env['LEON_WARM_UP_LLM_DUTIES'] === 'true'
 export const HAS_OVER_HTTP = process.env['LEON_OVER_HTTP'] === 'true'
 export const HTTP_API_KEY = process.env['LEON_HTTP_API_KEY']
 export const HTTP_API_LANG = process.env['LEON_HTTP_API_LANG']
@@ -299,22 +392,6 @@ export const PYTHON_TCP_SERVER_PORT = Number(
 
 export const IS_TELEMETRY_ENABLED = process.env['LEON_TELEMETRY'] === 'true'
 
-/**
- * NLP models paths
- */
-export const MAIN_NLP_MODEL_PATH = path.join(MODELS_PATH, 'leon-main-model.nlp')
-export const GLOBAL_RESOLVERS_NLP_MODEL_PATH = path.join(
-  MODELS_PATH,
-  'leon-global-resolvers-model.nlp'
-)
-export const SKILLS_RESOLVERS_NLP_MODEL_PATH = path.join(
-  MODELS_PATH,
-  'leon-skills-resolvers-model.nlp'
-)
-export const LLM_ACTIONS_CLASSIFIER_PATH = path.join(
-  MODELS_PATH,
-  'leon-llm-actions-classifier.json'
-)
 export const LLM_SKILL_ROUTER_DUTY_SKILL_LIST_PATH = path.join(
   MODELS_PATH,
   'leon-skill-list.nlp'
@@ -324,71 +401,54 @@ export const LLM_SKILL_ROUTER_DUTY_SKILL_LIST_PATH = path.join(
  * LLMs
  * @see k-quants comparison: https://github.com/ggerganov/llama.cpp/pull/1684
  */
-export const HAS_LLM = process.env['LEON_LLM'] === 'true'
-export const HAS_LLM_NLG = process.env['LEON_LLM_NLG'] === 'true' && HAS_LLM
-export const HAS_LLM_ACTION_RECOGNITION =
-  process.env['LEON_LLM_ACTION_RECOGNITION'] === 'true' && HAS_LLM
+export const HAS_LLM = true
 export const LEON_ROUTING_MODE = process.env['LEON_ROUTING_MODE'] || 'smart'
+export const LEON_MOOD = process.env['LEON_MOOD'] || 'auto'
 export const LEON_PULSE_ENABLED = true
+// Every 30 minutes
 export const LEON_PULSE_INTERVAL_MS = 30 * 60 * 1_000
-export const SHOULD_START_PYTHON_TCP_SERVER = !(
-  LEON_ROUTING_MODE.toLowerCase() === 'agent' &&
-  !HAS_STT &&
-  !HAS_TTS
-)
+export const SHOULD_START_PYTHON_TCP_SERVER = HAS_STT || HAS_TTS
 export const LEON_DISABLED_CONTEXT_FILES =
   process.env['LEON_DISABLED_CONTEXT_FILES'] || ''
-export const LLM_PROVIDER = process.env['LEON_LLM_PROVIDER']
-// export const LLM_VERSION = 'v0.2.Q4_K_S'
-// export const LLM_VERSION = '8B-Instruct.Q5_K_S'
-// export const LLM_VERSION = '2.9-llama3-8b.Q5_K_S'
-// export const LLM_VERSION = '3.1-8B-Lexi-Uncensored_V2_Q5'
-// export const LLM_VERSION = '3-8B-Uncensored-Q5_K_S'
-// export const LLM_VERSION = 'Q4_K_M'
-// export const LLM_VERSION = '4b-it-Q5_K_M'
-// export const LLM_VERSION = '3b-instruct-q5_k_m'
-// export const LLM_VERSION = '8B-Lexi-Uncensored.i1-Q5_K_S'
-export const LLM_VERSION = '4B-Q4_K_M'
-// export const LLM_VERSION = '8B-Abliterated.i1-Q5_K_S'
-// export const LLM_VERSION = '3-mini-128k-instruct.Q5_K_S'
-// export const LLM_VERSION = '3-mini-4k-instruct-q4'
-// export const LLM_VERSION = '1.1-7b-it-Q4_K_M'
-// export const LLM_VERSION = '8B-Instruct-Q4_K_S'
-// export const LLM_NAME = 'Mistral 7B Instruct'
-// export const LLM_NAME = 'Meta-Llama-3-8B-Instruct'
-// export const LLM_NAME = 'Dolphin 2.9 Llama-3-8B'
-// export const LLM_NAME = 'Llama-3.1-8B-Lexi-Uncensored-V2'
-// export const LLM_NAME = 'Llama-3.1-SuperNova-Lite (8B)'
-// export const LLM_NAME = 'Gemma 3 12B IT Abliterated'
-// export const LLM_NAME = 'Gemma-3-4B-IT'
-// export const LLM_NAME = 'Qwen2.5-3B-Instruct'
-export const LLM_NAME = 'Qwen3-4B'
-// export const LLM_NAME = 'Lexi-Llama-3-8B-Uncensored'
-// export const LLM_NAME = 'Llama-3-8B-Lexi-Uncensored'
-// export const LLM_NAME = 'DeepSeek-R1-Distill-Llama'
-// export const LLM_NAME = 'Phi-3-Mini-128K-Instruct'
-// export const LLM_NAME = 'Phi-3-mini'
-// export const LLM_NAME = 'Gemma 1.1 7B (IT)'
-// export const LLM_NAME = 'Meta Llama 3 8B Instruct'
-// export const LLM_FILE_NAME = `mistral-7b-instruct-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `Meta-Llama-3-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `dolphin-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `Llama-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `Lexi-Llama-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `supernova-lite-v1-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `gemma-3-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `qwen2.5-${LLM_VERSION}.gguf`
-export const LLM_FILE_NAME = `Qwen3-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `Llama-3-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `DeepSeek-R1-Distill-Llama-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `Phi-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `gemma-${LLM_VERSION}.gguf`
-// export const LLM_FILE_NAME = `Meta-Llama-3-${LLM_VERSION}.gguf`
-export const LLM_NAME_WITH_VERSION = `${LLM_NAME} (${LLM_VERSION})`
 export const LLM_DIR_PATH = path.join(MODELS_PATH, 'llm')
-export const LLM_PATH = path.join(LLM_DIR_PATH, LLM_FILE_NAME)
-export const LLM_MINIMUM_TOTAL_VRAM = 8
-export const LLM_MINIMUM_FREE_VRAM = 8
+export const LLM_MANIFEST_PATH = path.join(LLM_DIR_PATH, 'manifest.json')
+const {
+  defaultInstalledLLMPath,
+  installedLLMName,
+  installedLLMVersion
+} = getInstalledLLMMetadata(LLM_MANIFEST_PATH)
+export const DEFAULT_INSTALLED_LLM_PATH = defaultInstalledLLMPath
+export const LEON_LLM = process.env['LEON_LLM'] || ''
+export const LEON_WORKFLOW_LLM = process.env['LEON_WORKFLOW_LLM'] || ''
+export const LEON_AGENT_LLM = process.env['LEON_AGENT_LLM'] || ''
+export const WORKFLOW_LLM_TARGET = resolveConfiguredLLMTarget(
+  LEON_WORKFLOW_LLM.trim() || LEON_LLM.trim(),
+  {
+    defaultInstalledLLMPath: DEFAULT_INSTALLED_LLM_PATH,
+    llmDirPath: LLM_DIR_PATH
+  }
+)
+export const AGENT_LLM_TARGET = resolveConfiguredLLMTarget(
+  LEON_AGENT_LLM.trim() || LEON_LLM.trim(),
+  {
+    defaultInstalledLLMPath: DEFAULT_INSTALLED_LLM_PATH,
+    llmDirPath: LLM_DIR_PATH
+  }
+)
+export const WORKFLOW_LLM_PROVIDER = WORKFLOW_LLM_TARGET.provider
+export const AGENT_LLM_PROVIDER = AGENT_LLM_TARGET.provider
+export const LLM_NAME = installedLLMName
+export const LLM_VERSION = installedLLMVersion
+export const LLM_FILE_NAME = DEFAULT_INSTALLED_LLM_PATH
+  ? path.basename(DEFAULT_INSTALLED_LLM_PATH)
+  : ''
+export const LLM_NAME_WITH_VERSION = `${LLM_NAME} (${LLM_VERSION})`
+export const LLM_PATH = DEFAULT_INSTALLED_LLM_PATH
+  ? path.resolve(process.cwd(), DEFAULT_INSTALLED_LLM_PATH)
+  : ''
+export const LLM_MINIMUM_TOTAL_VRAM = 6
+export const LLM_HIGH_TIER_MINIMUM_TOTAL_VRAM = 18
+export const LLM_MINIMUM_FREE_VRAM = 6
 /*export const LLM_HF_DOWNLOAD_URL =
   'https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q5_K_S.gguf?download=true'
 */
@@ -407,8 +467,9 @@ export const LLM_MINIMUM_FREE_VRAM = 8
   'https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q5_K_M.gguf?download=true'*/
 /*export const LLM_HF_DOWNLOAD_URL =
   'https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q5_k_m.gguf?download=true'*/
-export const LLM_HF_DOWNLOAD_URL =
+/*export const LLM_HF_DOWNLOAD_URL =
   'https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf?download=true'
+*/
 /*export const LLM_HF_DOWNLOAD_URL =
   'https://huggingface.co/mradermacher/Llama-3-8B-Lexi-Uncensored-i1-GGUF/resolve/main/Llama-3-8B-Lexi-Uncensored.i1-Q5_K_S.gguf?download=true'*/
 /*export const LLM_HF_DOWNLOAD_URL =

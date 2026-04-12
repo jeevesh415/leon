@@ -71,7 +71,7 @@ export type PlanResult =
 
 export type ExecutionStepResult =
   | { type: 'handoff', signal: FinalResponseSignal }
-  | { type: 'replan', reason: string, functions: string[] }
+  | { type: 'replan', reason: string, steps: PlanStep[] }
   | {
       type: 'executed'
       execution: ExecutionRecord
@@ -138,7 +138,7 @@ export interface LLMCaller {
     prompt: string,
     systemPrompt: string,
     tools: OpenAITool[],
-    toolChoice: OpenAIToolChoice,
+    toolChoice?: OpenAIToolChoice,
     history?: MessageLog[],
     shouldStreamToUser?: boolean,
     promptSections?: PromptLogSection[],

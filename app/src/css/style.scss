@@ -5,6 +5,7 @@
 @import '@fontsource/source-sans-pro/700.css';
 @import '@fontsource/source-sans-pro/900.css';
 @import 'remixicon/fonts/remixicon.css';
+@import 'tool-ui.scss';
 @import 'voice-energy/main.scss';
 
 html,
@@ -131,6 +132,8 @@ table {
 }
 
 :root {
+  color-scheme: dark;
+
   --black-color: #000;
   --light-black-color: #222426;
   --white-color: #fff;
@@ -169,6 +172,7 @@ body {
     'Noto Color Emoji';
   font-weight: 400;
 }
+
 
 @keyframes plan-tool-status-cozy-shine {
   0% {
@@ -445,11 +449,19 @@ textarea::-webkit-scrollbar-thumb {
 
 .bubble-container {
   padding: 6px;
+  display: flex;
+  flex-direction: column;
+  width: fit-content;
+  max-width: 60%;
 }
 .bubble-container.me {
+  margin-left: auto;
+  align-items: flex-end;
   text-align: right;
 }
 .bubble-container.leon {
+  margin-right: auto;
+  align-items: flex-start;
   text-align: left;
 }
 .show-more {
@@ -468,7 +480,7 @@ textarea::-webkit-scrollbar-thumb {
   padding: 10px 16px;
   border-radius: 16px;
   display: inline-block;
-  max-width: 60%;
+  max-width: 100%;
   word-break: break-word;
   text-align: left;
   opacity: 0;
@@ -476,6 +488,31 @@ textarea::-webkit-scrollbar-thumb {
   overflow: hidden;
   font-size: 1.8rem;
   line-height: 2.4rem;
+}
+.bubble-metrics {
+  cursor: default;
+  margin-top: 2px;
+  padding: 0 4px;
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  font-size: 0.95rem;
+  line-height: 1.2rem;
+  color: var(--grey-color);
+  align-self: flex-end;
+  text-align: right;
+}
+.bubble-metric-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.bubble-metric-item i {
+  font-size: 1rem;
+}
+#feed .me .bubble-metrics {
+  text-align: right;
 }
 #feed .me .bubble {
   background-color: #1c75db;
@@ -490,33 +527,6 @@ textarea::-webkit-scrollbar-thumb {
   100% {
     opacity: 1;
   }
-}
-
-#suggestions-container {
-  position: absolute;
-  z-index: 10;
-  width: 100%;
-  bottom: 36%;
-  display: flex;
-  justify-content: flex-end;
-  column-gap: 8px;
-  overflow-x: auto;
-}
-.suggestion {
-  border: 1px solid var(--white-color);
-  background-color: transparent;
-  color: var(--white-color);
-  border-radius: 8px;
-  padding: 2px 8px;
-  font-size: inherit;
-  cursor: pointer;
-  transition:
-    background-color 0.2s,
-    color 0.2s;
-}
-.suggestion:hover {
-  color: var(--black-color);
-  background-color: var(--white-color);
 }
 
 #input-container {
@@ -592,106 +602,4 @@ textarea::-webkit-scrollbar-thumb {
 .clickable-path {
   cursor: pointer;
   text-decoration: underline;
-}
-
-/* Tool Output Container Styles */
-.tool-group-container {
-  margin: 8px 6px;
-  border: 1px solid var(--grey-color);
-  border-radius: 8px;
-  background-color: #1a1a1a;
-  font-family: 'Courier New', Consolas, monospace;
-  font-size: 0.9em;
-  opacity: 0;
-  animation: fadeIn 0.3s ease-in forwards;
-}
-
-.tool-header {
-  display: flex;
-  align-items: center;
-  padding: 8px 12px;
-  background-color: var(--light-black-color);
-  border-radius: 8px 8px 0 0;
-  cursor: pointer;
-  border-bottom: 1px solid var(--grey-color);
-  transition: background-color 0.2s;
-}
-
-.tool-header:hover {
-  background-color: #2a2c2e;
-}
-
-.tool-icon {
-  color: var(--blue-color);
-  margin-right: 8px;
-  font-size: 16px;
-}
-
-.tool-name {
-  flex: 1;
-  font-weight: 600;
-  color: var(--white-color);
-  font-size: 0.95em;
-}
-
-.expand-icon {
-  color: var(--grey-color);
-  font-size: 18px;
-  transition: transform 0.2s ease;
-}
-
-.expand-icon.rotated {
-  transform: rotate(180deg);
-}
-
-.tool-content {
-  max-height: 0;
-  overflow: hidden;
-  transition: max-height 0.3s ease;
-}
-
-.tool-content.expanded {
-  max-height: 500px;
-  overflow-y: auto;
-}
-
-.tool-content::-webkit-scrollbar {
-  width: 4px;
-}
-
-.tool-content::-webkit-scrollbar-thumb {
-  background-color: rgba(255, 255, 255, 0.1);
-  border-radius: 2px;
-}
-
-.shell-output {
-  padding: 12px;
-  background-color: #0d1117;
-  border-radius: 0 0 8px 8px;
-  min-height: 40px;
-}
-
-.shell-message {
-  margin: 2px 0;
-  line-height: 1.4;
-  color: #e6edf3;
-  word-break: break-word;
-}
-
-.shell-prompt {
-  color: var(--pink-color);
-  font-weight: bold;
-  margin-right: 8px;
-}
-
-.shell-message .clickable-path {
-  color: var(--blue-color);
-  background-color: rgba(28, 117, 219, 0.1);
-  padding: 1px 4px;
-  border-radius: 3px;
-  border: 1px solid rgba(28, 117, 219, 0.3);
-}
-
-.shell-message .clickable-url {
-  color: var(--blue-color);
 }

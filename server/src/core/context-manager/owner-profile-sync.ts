@@ -13,7 +13,8 @@ import {
   type OwnerProfile,
   writeOwnerProfile
 } from '@/core/context-manager/owner-profile'
-import { LLMDuties } from '@/core/llm-manager/types'
+import { LLMDuties, LLMProviders } from '@/core/llm-manager/types'
+import { CONFIG_STATE } from '@/core/config-states/config-state'
 
 const OWNER_DOCUMENT_TOKEN_BUDGET = 2_000
 const OWNER_DOCUMENT_UPDATE_TIMEOUT_MS = 30_000
@@ -321,13 +322,20 @@ async function promptForOwnerDocument(
 ): Promise<unknown> {
   const { LLM_PROVIDER } = await import('@/core')
   const completion = await LLM_PROVIDER.prompt(prompt, {
-    dutyType: LLMDuties.Custom,
+    dutyType: LLMDuties.Inference,
     systemPrompt,
     timeout,
     maxRetries: OWNER_DOCUMENT_MAX_RETRIES,
     maxTokens,
-    disableThinking: true,
     trackProviderErrors: false,
+        /**
+         * Disable thinking when Llama.cpp since local models tend
+         * to loop overthink
+         */
+        ...(CONFIG_STATE.getModelState().getWorkflowProvider() ===
+        LLMProviders.LlamaCPP
+          ? { disableThinking: true }
+          : {}),
     ...(data ? { data } : {})
   })
 

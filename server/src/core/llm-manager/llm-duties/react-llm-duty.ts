@@ -1,8 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import type { ChatHistoryItem, LlamaContext } from 'node-llama-cpp'
-import { LlamaChatSession } from 'node-llama-cpp'
+import type { ChatHistoryItem, LlamaContext, LlamaChatSession } from 'node-llama-cpp'
 
 import {
   DEFAULT_INIT_PARAMS,
@@ -33,8 +32,14 @@ import {
   type OpenAIToolChoice
 } from '@/core/llm-manager/types'
 import { ContextStateStore } from '@/core/context-manager/context-state-store'
-import { LLM_PROVIDER as LLM_PROVIDER_NAME, LOGS_PATH } from '@/constants'
+import { LOGS_PATH } from '@/constants'
 import type { MessageLog } from '@/types'
+import { ConversationHistoryHelper } from '@/helpers/conversation-history-helper'
+import { CONFIG_STATE } from '@/core/config-states/config-state'
+
+function getLLMProviderName(): LLMProviders {
+  return CONFIG_STATE.getModelState().getAgentProvider()
+}
 
 import {
   PLAN_SYSTEM_PROMPT,
@@ -80,7 +85,6 @@ import {
   runExecutionStep,
   runFinalAnswerPhase
 } from './react-llm-duty/phases'
-import { buildStepLabelFromFunction } from './react-llm-duty/phase-helpers'
 import {
   buildCompactedHistoryMessage,
   findMessageSequenceStart,
@@ -89,6 +93,13 @@ import {
   normalizeHistoryCompactionSummary,
   toChatHistoryItems
 } from './react-llm-duty/history-compaction'
+import {
+  type AccumulatedLLMMetricsState,
+  type FinalAnswerMetricsSnapshot,
+  type RawPhaseMetrics,
+  deriveLLMMetrics,
+  observeCompletionMetrics
+} from './react-llm-duty/metrics'
 
 const REACT_CONTINUATION_STATE_FILENAME = '.react-execution-continuation-state.json'
 const REACT_HISTORY_COMPACTION_STATE_FILENAME =
@@ -127,6 +138,7 @@ interface ReactHistoryCompactionProviderState {
   summary: string | null
   summarySentAt: number | null
   tail: MessageLog[]
+  newMessagesSinceCompaction: number
 }
 
 interface ReactHistoryCompactionState {
@@ -160,7 +172,8 @@ function createEmptyHistoryCompactionProviderState(): ReactHistoryCompactionProv
   return {
     summary: null,
     summarySentAt: null,
-    tail: []
+    tail: [],
+    newMessagesSinceCompaction: 0
   }
 }
 
@@ -190,6 +203,18 @@ export class ReActLLMDuty extends LLMDuty {
   protected input: LLMDutyParams['input'] = null
   private totalInputTokens = 0
   private totalOutputTokens = 0
+  private totalVisibleOutputTokens = 0
+  private totalOutputChars = 0
+  private totalGenerationDurationMs = 0
+  private phaseMetrics: RawPhaseMetrics = {
+    planning: { outputTokens: 0, durationMs: 0 },
+    execution: { outputTokens: 0, durationMs: 0 },
+    recovery: { outputTokens: 0, durationMs: 0 },
+    final_answer: { outputTokens: 0, durationMs: 0 }
+  }
+  private finalAnswerMetrics: FinalAnswerMetricsSnapshot | null = null
+
+  private executionStartedAt = 0
   private hasStreamedTokenEmission = false
   private hasExplicitMemoryWrite = false
   private reasoningGenerationId: string | null = null
@@ -225,7 +250,7 @@ export class ReActLLMDuty extends LLMDuty {
       await CONTEXT_MANAGER.load()
     }
 
-    if (LLM_PROVIDER_NAME === LLMProviders.Local) {
+    if (getLLMProviderName() === LLMProviders.Local) {
       if (!ReActLLMDuty.session || params.force) {
         LogHelper.title(this.name)
         LogHelper.info('Initializing...')
@@ -242,6 +267,10 @@ export class ReActLLMDuty extends LLMDuty {
           }
 
           ReActLLMDuty.context = await LLM_MANAGER.model.createContext()
+
+          const { LlamaChatSession } = await Function(
+            'return import("node-llama-cpp")'
+          )()
 
           ReActLLMDuty.session = new LlamaChatSession({
             contextSequence: ReActLLMDuty.context.getSequence(),
@@ -262,8 +291,19 @@ export class ReActLLMDuty extends LLMDuty {
     LogHelper.title(this.name)
     LogHelper.info('Executing...')
 
+    this.executionStartedAt = Date.now()
     this.totalInputTokens = 0
     this.totalOutputTokens = 0
+    this.totalVisibleOutputTokens = 0
+    this.totalOutputChars = 0
+    this.totalGenerationDurationMs = 0
+    this.phaseMetrics = {
+      planning: { outputTokens: 0, durationMs: 0 },
+      execution: { outputTokens: 0, durationMs: 0 },
+      recovery: { outputTokens: 0, durationMs: 0 },
+      final_answer: { outputTokens: 0, durationMs: 0 }
+    }
+    this.finalAnswerMetrics = null
     this.hasStreamedTokenEmission = false
     this.hasExplicitMemoryWrite = false
     this.reasoningGenerationId = StringHelper.random(6, { onlyLetters: true })
@@ -275,7 +315,7 @@ export class ReActLLMDuty extends LLMDuty {
       const { messageLogs: history, localChatHistory } =
         await this.loadPreparedHistory()
 
-      if (LLM_PROVIDER_NAME === LLMProviders.Local && localChatHistory) {
+      if (getLLMProviderName() === LLMProviders.Local && localChatHistory) {
         ReActLLMDuty.session.setChatHistory(localChatHistory)
       }
 
@@ -290,7 +330,7 @@ export class ReActLLMDuty extends LLMDuty {
 
       LogHelper.title(this.name)
       LogHelper.debug(`Catalog mode: ${catalog.mode} | Catalog length: ${catalog.text.length} chars (~${Math.ceil(catalog.text.length / 4)} tokens) | Input: "${this.input}"`)
-      LogHelper.debug(`Native tools supported: ${this.supportsNativeTools} (provider: ${LLM_PROVIDER_NAME})`)
+      LogHelper.debug(`Native tools supported: ${this.supportsNativeTools} (provider: ${getLLMProviderName()})`)
       if (continuation) {
         LogHelper.debug(
           `Resuming paused execution from clarification: "${continuation.state.clarificationQuestion}"`
@@ -555,7 +595,7 @@ export class ReActLLMDuty extends LLMDuty {
           replanCount += 1
           LogHelper.title(this.name)
           LogHelper.debug(
-            `Re-plan ${replanCount}/${MAX_REPLANS}: reason="${stepResult.reason}" | new steps: ${stepResult.functions.join(' -> ')}`
+            `Re-plan ${replanCount}/${MAX_REPLANS}: reason="${stepResult.reason}" | new steps: ${stepResult.steps.map((step) => step.function).join(' -> ')}`
           )
 
           if (replanCount > MAX_REPLANS) {
@@ -564,9 +604,9 @@ export class ReActLLMDuty extends LLMDuty {
             break
           }
 
-          pendingSteps = stepResult.functions.map((f) => ({
-            function: f,
-            label: buildStepLabelFromFunction(f)
+          pendingSteps = stepResult.steps.map((step) => ({
+            function: step.function,
+            label: step.label
           }))
 
           // Rebuild tracked steps: keep completed ones, replace remaining
@@ -835,12 +875,12 @@ export class ReActLLMDuty extends LLMDuty {
 
           if (
             selfObservationResult?.type === 'replan' &&
-            selfObservationResult.functions.length > 0
+            selfObservationResult.steps.length > 0
           ) {
             replanCount += 1
-            pendingSteps = selfObservationResult.functions.map((f) => ({
-              function: f,
-              label: buildStepLabelFromFunction(f)
+            pendingSteps = selfObservationResult.steps.map((step) => ({
+              function: step.function,
+              label: step.label
             }))
 
             LogHelper.title(this.name)
@@ -930,7 +970,9 @@ export class ReActLLMDuty extends LLMDuty {
   private async loadPreparedHistory(): Promise<PreparedReactHistory> {
     const historyConfig = this.getHistoryCompactionConfig()
     const historyScope = this.getHistoryCompactionScope()
-    const conversationLogs = await CONVERSATION_LOGGER.loadAll()
+    const conversationLogs = this.getHistoryEligibleConversationLogs(
+      await CONVERSATION_LOGGER.loadAll()
+    )
     const currentState = this.loadHistoryCompactionProviderState(historyScope)
     const synchronizedState = this.synchronizeHistoryCompactionState(
       conversationLogs,
@@ -951,11 +993,11 @@ export class ReActLLMDuty extends LLMDuty {
   }
 
   private getHistoryCompactionScope(): ReactHistoryCompactionScope {
-    return LLM_PROVIDER_NAME === LLMProviders.Local ? 'local' : 'remote'
+    return getLLMProviderName() === LLMProviders.Local ? 'local' : 'remote'
   }
 
   private getHistoryCompactionConfig(): ReactHistoryCompactionConfig {
-    if (LLM_PROVIDER_NAME === LLMProviders.Local) {
+    if (getLLMProviderName() === LLMProviders.Local) {
       return {
         historyLimit: REACT_LOCAL_PROVIDER_HISTORY_LOGS,
         compactionBatchSize: REACT_LOCAL_PROVIDER_HISTORY_COMPACTION_POINT
@@ -966,6 +1008,14 @@ export class ReActLLMDuty extends LLMDuty {
       historyLimit: REACT_REMOTE_PROVIDER_HISTORY_LOGS,
       compactionBatchSize: REACT_REMOTE_PROVIDER_HISTORY_COMPACTION_POINT
     }
+  }
+
+  private getHistoryEligibleConversationLogs(
+    conversationLogs: MessageLog[]
+  ): MessageLog[] {
+    return conversationLogs.filter(
+      (conversationLog) => ConversationHistoryHelper.isAddedToHistory(conversationLog)
+    )
   }
 
   private loadHistoryCompactionProviderState(
@@ -989,6 +1039,12 @@ export class ReActLLMDuty extends LLMDuty {
         typeof record?.['summarySentAt'] === 'number'
           ? record['summarySentAt']
           : null,
+      newMessagesSinceCompaction:
+        typeof record?.['newMessagesSinceCompaction'] === 'number' &&
+        Number.isFinite(record['newMessagesSinceCompaction']) &&
+        record['newMessagesSinceCompaction'] >= 0
+          ? Math.floor(record['newMessagesSinceCompaction'])
+          : 0,
       tail: this.normalizeMessageLogs(record?.['tail'])
     }
   }
@@ -1037,7 +1093,11 @@ export class ReActLLMDuty extends LLMDuty {
         {
           who: record['who'],
           sentAt: record['sentAt'],
-          message: record['message']
+          message: record['message'],
+          isAddedToHistory:
+            typeof record['isAddedToHistory'] === 'boolean'
+              ? record['isAddedToHistory']
+              : true
         }
       ]
     })
@@ -1049,7 +1109,8 @@ export class ReActLLMDuty extends LLMDuty {
     return Boolean(
       hasHistoryCompactionContent(state.summary) ||
         state.summarySentAt !== null ||
-        state.tail.length > 0
+        state.tail.length > 0 ||
+        state.newMessagesSinceCompaction > 0
     )
   }
 
@@ -1077,8 +1138,32 @@ export class ReActLLMDuty extends LLMDuty {
     return (
       left.summary === right.summary &&
       left.summarySentAt === right.summarySentAt &&
+      left.newMessagesSinceCompaction === right.newMessagesSinceCompaction &&
       this.areMessageLogsEqual(left.tail, right.tail)
     )
+  }
+
+  private rebuildHistoryCompactionStateFromBoundary(
+    conversationLogs: MessageLog[],
+    currentState: ReactHistoryCompactionProviderState
+  ): ReactHistoryCompactionProviderState {
+    if (
+      !hasHistoryCompactionContent(currentState.summary) ||
+      currentState.summarySentAt === null
+    ) {
+      return createEmptyHistoryCompactionProviderState()
+    }
+
+    const rebuiltTail = conversationLogs.filter(
+      (conversationLog) => conversationLog.sentAt > currentState.summarySentAt!
+    )
+
+    return {
+      summary: currentState.summary,
+      summarySentAt: currentState.summarySentAt,
+      tail: rebuiltTail,
+      newMessagesSinceCompaction: rebuiltTail.length
+    }
   }
 
   private synchronizeHistoryCompactionState(
@@ -1100,27 +1185,48 @@ export class ReActLLMDuty extends LLMDuty {
     }
 
     if (currentState.tail.length === 0) {
+      const rebuiltState = this.rebuildHistoryCompactionStateFromBoundary(
+        conversationLogs,
+        currentState
+      )
+
       return {
-        state: emptyState,
-        shouldPersist: true
+        state: rebuiltState,
+        shouldPersist: !this.areHistoryCompactionStatesEqual(
+          currentState,
+          rebuiltState
+        )
       }
     }
 
     const tailStartIndex = findMessageSequenceStart(conversationLogs, currentState.tail)
     if (tailStartIndex === -1) {
+      const rebuiltState = this.rebuildHistoryCompactionStateFromBoundary(
+        conversationLogs,
+        currentState
+      )
+
       LogHelper.title(this.name)
-      LogHelper.debug('History compaction state reset; rebuilding from raw logs')
+      LogHelper.debug(
+        'History compaction tail mismatch; rebuilding from compaction boundary'
+      )
 
       return {
-        state: emptyState,
-        shouldPersist: true
+        state: rebuiltState,
+        shouldPersist: !this.areHistoryCompactionStatesEqual(
+          currentState,
+          rebuiltState
+        )
       }
     }
 
     const synchronizedState: ReactHistoryCompactionProviderState = {
       summary: currentState.summary,
       summarySentAt: currentState.summarySentAt,
-      tail: conversationLogs.slice(tailStartIndex)
+      tail: conversationLogs.slice(tailStartIndex),
+      newMessagesSinceCompaction:
+        currentState.newMessagesSinceCompaction +
+        (conversationLogs.length - tailStartIndex - currentState.tail.length)
     }
 
     return {
@@ -1137,12 +1243,11 @@ export class ReActLLMDuty extends LLMDuty {
     state: ReactHistoryCompactionProviderState,
     config: ReactHistoryCompactionConfig
   ): MessageLog[] {
-    if (
-      hasHistoryCompactionContent(state.summary) &&
-      state.tail.length > 0 &&
-      state.tail.length < config.historyLimit
-    ) {
-      return this.buildHistoryFromCompactionState(state)
+    if (hasHistoryCompactionContent(state.summary)) {
+      return this.buildHistoryFromCompactionState({
+        ...state,
+        tail: state.tail.slice(-(config.historyLimit - 1))
+      })
     }
 
     return conversationLogs.slice(-config.historyLimit)
@@ -1159,7 +1264,8 @@ export class ReActLLMDuty extends LLMDuty {
     return {
       summary: null,
       summarySentAt: null,
-      tail: [...conversationLogs]
+      tail: [...conversationLogs],
+      newMessagesSinceCompaction: conversationLogs.length
     }
   }
 
@@ -1167,18 +1273,28 @@ export class ReActLLMDuty extends LLMDuty {
     state: ReactHistoryCompactionProviderState,
     config: ReactHistoryCompactionConfig
   ): Promise<ReactHistoryCompactionProviderState | null> {
+    const hadCompactedSummary = hasHistoryCompactionContent(state.summary)
     let nextSummary = state.summary
     let nextSummarySentAt = state.summarySentAt
     let nextTail = [...state.tail]
+    let nextNewMessagesSinceCompaction = state.newMessagesSinceCompaction
     let compactedBatches = 0
     let compactedMessages = 0
 
-    while (nextTail.length >= config.historyLimit) {
+    while (
+      hadCompactedSummary
+        ? nextNewMessagesSinceCompaction >= config.compactionBatchSize
+        : nextTail.length >= config.historyLimit
+    ) {
       const batch = nextTail.slice(0, config.compactionBatchSize)
 
       LogHelper.title(this.name)
       LogHelper.debug(
-        `History compaction triggering: batch=${batch.length} tail=${nextTail.length} threshold=${config.historyLimit}`
+        `History compaction triggering: batch=${batch.length} tail=${nextTail.length} threshold=${
+          hadCompactedSummary
+            ? config.compactionBatchSize
+            : config.historyLimit
+        } new_messages=${nextNewMessagesSinceCompaction}`
       )
 
       const compactedSummary = await this.compactHistoryLogs(batch, nextSummary)
@@ -1191,6 +1307,12 @@ export class ReActLLMDuty extends LLMDuty {
       nextSummarySentAt =
         batch[batch.length - 1]?.sentAt ?? nextSummarySentAt ?? Date.now()
       nextTail = nextTail.slice(config.compactionBatchSize)
+      if (hadCompactedSummary) {
+        nextNewMessagesSinceCompaction = Math.max(
+          0,
+          nextNewMessagesSinceCompaction - batch.length
+        )
+      }
       compactedBatches += 1
       compactedMessages += batch.length
     }
@@ -1205,7 +1327,10 @@ export class ReActLLMDuty extends LLMDuty {
     return {
       summary: nextSummary,
       summarySentAt: nextSummarySentAt,
-      tail: nextTail
+      tail: nextTail,
+      newMessagesSinceCompaction: hadCompactedSummary
+        ? nextNewMessagesSinceCompaction
+        : 0
     }
   }
 
@@ -1215,7 +1340,9 @@ export class ReActLLMDuty extends LLMDuty {
   ): Promise<void> {
     const historyConfig = this.getHistoryCompactionConfig()
     const historyScope = this.getHistoryCompactionScope()
-    const conversationLogs = await CONVERSATION_LOGGER.loadAll()
+    const conversationLogs = this.getHistoryEligibleConversationLogs(
+      await CONVERSATION_LOGGER.loadAll()
+    )
     const currentState = this.loadHistoryCompactionProviderState(historyScope)
     const synchronizedState = this.synchronizeHistoryCompactionState(
       conversationLogs,
@@ -1231,7 +1358,12 @@ export class ReActLLMDuty extends LLMDuty {
       synchronizedState.state
     )
 
-    if (stateToCompact.tail.length < historyConfig.historyLimit) {
+    const shouldCompact = hasHistoryCompactionContent(stateToCompact.summary)
+      ? stateToCompact.newMessagesSinceCompaction >=
+        historyConfig.compactionBatchSize
+      : stateToCompact.tail.length >= historyConfig.historyLimit
+
+    if (!shouldCompact) {
       return
     }
 
@@ -1270,14 +1402,15 @@ export class ReActLLMDuty extends LLMDuty {
     const summaryMessage: MessageLog = {
       who: 'leon',
       sentAt: state.summarySentAt ?? state.tail[0]?.sentAt ?? Date.now(),
-      message: buildCompactedHistoryMessage(state.summary)
+      message: buildCompactedHistoryMessage(state.summary),
+      isAddedToHistory: true
     }
 
     return [summaryMessage, ...state.tail]
   }
 
   private buildPreparedHistory(history: MessageLog[]): PreparedReactHistory {
-    if (LLM_PROVIDER_NAME !== LLMProviders.Local) {
+    if (getLLMProviderName() !== LLMProviders.Local) {
       return {
         messageLogs: history
       }
@@ -1321,8 +1454,11 @@ export class ReActLLMDuty extends LLMDuty {
       try {
         let result = null
 
-        if (LLM_PROVIDER_NAME === LLMProviders.Local) {
+        if (getLLMProviderName() === LLMProviders.Local) {
           const tempContext = await LLM_MANAGER.model.createContext()
+          const { LlamaChatSession } = await Function(
+            'return import("node-llama-cpp")'
+          )()
           const tempSession = new LlamaChatSession({
             contextSequence: tempContext.getSequence(),
             autoDisposeSequence: true,
@@ -1506,7 +1642,7 @@ export class ReActLLMDuty extends LLMDuty {
    * mechanism and stays on grammar-based JSON mode.
    */
   private get supportsNativeTools(): boolean {
-    return LLM_PROVIDER_NAME !== LLMProviders.Local
+    return getLLMProviderName() !== LLMProviders.Local
   }
 
   /**
@@ -1544,6 +1680,9 @@ export class ReActLLMDuty extends LLMDuty {
     }
 
     const tempContext = await LLM_MANAGER.model.createContext()
+    const { LlamaChatSession } = await Function(
+      'return import("node-llama-cpp")'
+    )()
     const tempSession = new LlamaChatSession({
       contextSequence: tempContext.getSequence(),
       autoDisposeSequence: true,
@@ -1569,9 +1708,13 @@ export class ReActLLMDuty extends LLMDuty {
     output: unknown
     usedInputTokens?: number
     usedOutputTokens?: number
+    generationDurationMs?: number
+    providerDecodeDurationMs?: number
+    providerTokensPerSecond?: number
     reasoning?: string
   } | null> {
     const phase = options?.phase ?? 'execution'
+    const completionStartedAt = Date.now()
     const phasePolicy = getPhasePolicy(phase)
     const reasoningMode =
       options?.disableThinking === true
@@ -1582,7 +1725,7 @@ export class ReActLLMDuty extends LLMDuty {
       options?.emitReasoning ?? phasePolicy.emitReasoning
     const shouldStream =
       (options?.streamToProvider ?? phasePolicy.streamToProvider) &&
-      LLM_PROVIDER_NAME !== LLMProviders.Local
+      getLLMProviderName() !== LLMProviders.Local
     const reasoningGenerationId = shouldEmitReasoning
       ? this.getReasoningGenerationId(
           phase,
@@ -1627,7 +1770,7 @@ export class ReActLLMDuty extends LLMDuty {
     }
 
     let result
-    if (LLM_PROVIDER_NAME === LLMProviders.Local) {
+    if (getLLMProviderName() === LLMProviders.Local) {
       result = await this.withLocalPromptSession(history, (session) =>
         LLM_PROVIDER.prompt(prompt, {
           ...completionParams,
@@ -1639,15 +1782,20 @@ export class ReActLLMDuty extends LLMDuty {
     }
 
     if (result) {
-      this.totalInputTokens += result.usedInputTokens ?? 0
-      this.totalOutputTokens += result.usedOutputTokens ?? 0
-      this.logPromptUsage(
+      const completionEndedAt = Date.now()
+      this.observeCompletionMetrics({
         phase,
-        'json',
-        result.usedInputTokens ?? 0,
-        result.usedOutputTokens ?? 0
-      )
-      this.logPromptReasoning(phase, 'json', result.reasoning)
+        channel: 'json',
+        completionStartedAt,
+        completedAt: completionEndedAt,
+        output: result.output,
+        reasoning: result.reasoning,
+        usedInputTokens: result.usedInputTokens,
+        usedOutputTokens: result.usedOutputTokens,
+        providerDecodeDurationMs: result.providerDecodeDurationMs,
+        providerTokensPerSecond: result.providerTokensPerSecond,
+        generationDurationMs: result.generationDurationMs
+      })
     }
 
     return result
@@ -1664,9 +1812,14 @@ export class ReActLLMDuty extends LLMDuty {
     output: string
     usedInputTokens?: number
     usedOutputTokens?: number
+    generationDurationMs?: number
+    providerDecodeDurationMs?: number
+    providerTokensPerSecond?: number
     reasoning?: string
   } | null> {
     const phase = options?.phase ?? 'execution'
+    const completionStartedAt = Date.now()
+    let firstVisibleTokenAt: number | null = null
     const phasePolicy = getPhasePolicy(phase)
     const reasoningMode =
       options?.disableThinking === true
@@ -1679,7 +1832,7 @@ export class ReActLLMDuty extends LLMDuty {
       options?.streamToUser ?? shouldStream ?? phasePolicy.streamToUser
     const shouldStreamEffective =
       (options?.streamToProvider ?? phasePolicy.streamToProvider) &&
-      LLM_PROVIDER_NAME !== LLMProviders.Local
+      getLLMProviderName() !== LLMProviders.Local
     const reasoningGenerationId = shouldEmitReasoning
       ? this.getReasoningGenerationId(
           phase,
@@ -1737,12 +1890,18 @@ export class ReActLLMDuty extends LLMDuty {
                     )
               )
 
+              if (phase === 'final_answer' && token.trim()) {
+                if (firstVisibleTokenAt === null) {
+                  firstVisibleTokenAt = Date.now()
+                }
+              }
+
               if (!token || !generationId) {
                 return
               }
 
               this.hasStreamedTokenEmission = true
-              SOCKET_SERVER.socket?.emit('llm-token', {
+              SOCKET_SERVER.emitToChatClients('llm-token', {
                 token,
                 generationId
               })
@@ -1753,7 +1912,7 @@ export class ReActLLMDuty extends LLMDuty {
     }
 
     let result
-    if (LLM_PROVIDER_NAME === LLMProviders.Local) {
+    if (getLLMProviderName() === LLMProviders.Local) {
       result = await this.withLocalPromptSession(history, (session) =>
         LLM_PROVIDER.prompt(prompt, {
           ...completionParams,
@@ -1768,15 +1927,21 @@ export class ReActLLMDuty extends LLMDuty {
       return null
     }
 
-    this.totalInputTokens += result.usedInputTokens ?? 0
-    this.totalOutputTokens += result.usedOutputTokens ?? 0
-    this.logPromptUsage(
+    const completionEndedAt = Date.now()
+    this.observeCompletionMetrics({
       phase,
-      'text',
-      result.usedInputTokens ?? 0,
-      result.usedOutputTokens ?? 0
-    )
-    this.logPromptReasoning(phase, 'text', result.reasoning)
+      channel: 'text',
+      completionStartedAt,
+      completedAt: completionEndedAt,
+      output: result.output,
+      reasoning: result.reasoning,
+      usedInputTokens: result.usedInputTokens,
+      usedOutputTokens: result.usedOutputTokens,
+      providerDecodeDurationMs: result.providerDecodeDurationMs,
+      providerTokensPerSecond: result.providerTokensPerSecond,
+      generationDurationMs: result.generationDurationMs,
+      ...(firstVisibleTokenAt ? { firstTokenAt: firstVisibleTokenAt } : {})
+    })
 
     return {
       output:
@@ -1785,6 +1950,13 @@ export class ReActLLMDuty extends LLMDuty {
           : this.safeJSONStringify(result.output),
       usedInputTokens: result.usedInputTokens,
       usedOutputTokens: result.usedOutputTokens,
+      generationDurationMs: result.generationDurationMs,
+      ...(result.providerTokensPerSecond
+        ? { providerTokensPerSecond: result.providerTokensPerSecond }
+        : {}),
+      ...(result.providerDecodeDurationMs
+        ? { providerDecodeDurationMs: result.providerDecodeDurationMs }
+        : {}),
       ...(result.reasoning ? { reasoning: result.reasoning } : {})
     }
   }
@@ -1798,7 +1970,7 @@ export class ReActLLMDuty extends LLMDuty {
     prompt: string,
     systemPrompt: string,
     tools: OpenAITool[],
-    toolChoice: OpenAIToolChoice,
+    toolChoice?: OpenAIToolChoice,
     history?: MessageLog[],
     shouldStreamToUser?: boolean,
     promptSections?: PromptLogSection[],
@@ -1809,14 +1981,16 @@ export class ReActLLMDuty extends LLMDuty {
     textContent?: string
     usedInputTokens?: number
     usedOutputTokens?: number
+    generationDurationMs?: number
+    providerDecodeDurationMs?: number
+    providerTokensPerSecond?: number
     reasoning?: string
   } | null> {
     const phase = options?.phase ?? 'execution'
+    const completionStartedAt = Date.now()
     const phasePolicy = getPhasePolicy(phase)
-    // Keep tool_choice explicit at call sites. This avoids hidden behavior and
-    // lets phases decide when forcing a tool is worth disabling thinking.
     const effectiveToolChoice: OpenAIToolChoice | undefined =
-      tools.length === 0 ? undefined : toolChoice
+      tools.length === 0 ? undefined : (toolChoice ?? 'auto')
     const reasoningMode =
       options?.disableThinking === true
         ? 'off'
@@ -1828,7 +2002,7 @@ export class ReActLLMDuty extends LLMDuty {
       options?.streamToUser ?? shouldStreamToUser ?? phasePolicy.streamToUser
     const shouldStreamEffective =
       (options?.streamToProvider ?? phasePolicy.streamToProvider) &&
-      LLM_PROVIDER_NAME !== LLMProviders.Local
+      getLLMProviderName() !== LLMProviders.Local
 
     const toolNames = tools.map((t) => t.function.name).join(', ')
     const choiceLabel =
@@ -1902,7 +2076,7 @@ export class ReActLLMDuty extends LLMDuty {
         prompt,
         systemPrompt,
         tools,
-        toolChoice,
+        effectiveToolChoice,
         history
       )
 
@@ -1968,7 +2142,7 @@ export class ReActLLMDuty extends LLMDuty {
                 }
 
                 this.hasStreamedTokenEmission = true
-                SOCKET_SERVER.socket?.emit('llm-token', {
+                SOCKET_SERVER.emitToChatClients('llm-token', {
                   token,
                   generationId
                 })
@@ -2000,20 +2174,25 @@ export class ReActLLMDuty extends LLMDuty {
       return null
     }
 
-    this.totalInputTokens += completionResult.usedInputTokens ?? 0
-    this.totalOutputTokens += completionResult.usedOutputTokens ?? 0
-    this.logPromptUsage(
-      phase,
-      'tools',
-      completionResult.usedInputTokens ?? 0,
-      completionResult.usedOutputTokens ?? 0
-    )
-    this.logPromptReasoning(phase, 'tools', completionResult.reasoning)
-
-    // Check if the model responded with tool calls
+    const completionEndedAt = Date.now()
     const toolCalls = (
       completionResult as unknown as { toolCalls?: OpenAIToolCall[] }
     ).toolCalls
+    this.observeCompletionMetrics({
+      phase,
+      channel: 'tools',
+      completionStartedAt,
+      completedAt: completionEndedAt,
+      output: completionResult.output,
+      reasoning: completionResult.reasoning,
+      usedInputTokens: completionResult.usedInputTokens,
+      usedOutputTokens: completionResult.usedOutputTokens,
+      providerDecodeDurationMs: completionResult.providerDecodeDurationMs,
+      providerTokensPerSecond: completionResult.providerTokensPerSecond,
+      generationDurationMs: completionResult.generationDurationMs
+    })
+
+    // Check if the model responded with tool calls
     if (toolCalls && toolCalls.length > 0) {
       const firstCall = toolCalls[0]!
       const allowedToolNames = new Set(tools.map((t) => t.function.name))
@@ -2039,6 +2218,13 @@ export class ReActLLMDuty extends LLMDuty {
           textContent: textContentFallback,
           usedInputTokens: completionResult.usedInputTokens,
           usedOutputTokens: completionResult.usedOutputTokens,
+          generationDurationMs: completionResult.generationDurationMs,
+          ...(completionResult.providerTokensPerSecond
+            ? { providerTokensPerSecond: completionResult.providerTokensPerSecond }
+            : {}),
+          ...(completionResult.providerDecodeDurationMs
+            ? { providerDecodeDurationMs: completionResult.providerDecodeDurationMs }
+            : {}),
           ...(completionResult.reasoning
             ? { reasoning: completionResult.reasoning }
             : {})
@@ -2061,6 +2247,13 @@ export class ReActLLMDuty extends LLMDuty {
         },
         usedInputTokens: completionResult.usedInputTokens,
         usedOutputTokens: completionResult.usedOutputTokens,
+        generationDurationMs: completionResult.generationDurationMs,
+        ...(completionResult.providerTokensPerSecond
+          ? { providerTokensPerSecond: completionResult.providerTokensPerSecond }
+          : {}),
+        ...(completionResult.providerDecodeDurationMs
+          ? { providerDecodeDurationMs: completionResult.providerDecodeDurationMs }
+          : {}),
         ...(completionResult.reasoning
           ? { reasoning: completionResult.reasoning }
           : {})
@@ -2080,6 +2273,13 @@ export class ReActLLMDuty extends LLMDuty {
       textContent,
       usedInputTokens: completionResult.usedInputTokens,
       usedOutputTokens: completionResult.usedOutputTokens,
+      generationDurationMs: completionResult.generationDurationMs,
+      ...(completionResult.providerTokensPerSecond
+        ? { providerTokensPerSecond: completionResult.providerTokensPerSecond }
+        : {}),
+      ...(completionResult.providerDecodeDurationMs
+        ? { providerDecodeDurationMs: completionResult.providerDecodeDurationMs }
+        : {}),
       ...(completionResult.reasoning
         ? { reasoning: completionResult.reasoning }
         : {})
@@ -2419,6 +2619,69 @@ export class ReActLLMDuty extends LLMDuty {
     )
   }
 
+  private observeCompletionMetrics(params: {
+    phase: ReactPhase
+    channel: 'json' | 'text' | 'tools'
+    completionStartedAt: number
+    completedAt: number
+    output?: unknown | undefined
+    reasoning?: string | undefined
+    usedInputTokens?: number | undefined
+    usedOutputTokens?: number | undefined
+    generationDurationMs?: number | undefined
+    providerDecodeDurationMs?: number | undefined
+    providerTokensPerSecond?: number | undefined
+    firstTokenAt?: number | null | undefined
+  }): void {
+    const observedMetrics = observeCompletionMetrics({
+      providerName: getLLMProviderName(),
+      accumulator: {
+        totalInputTokens: this.totalInputTokens,
+        totalOutputTokens: this.totalOutputTokens,
+        totalVisibleOutputTokens: this.totalVisibleOutputTokens,
+        totalOutputChars: this.totalOutputChars,
+        totalGenerationDurationMs: this.totalGenerationDurationMs,
+        phaseMetrics: this.phaseMetrics,
+        finalAnswerMetrics: this.finalAnswerMetrics
+      } satisfies AccumulatedLLMMetricsState,
+      phase: params.phase,
+      completionStartedAt: params.completionStartedAt,
+      completedAt: params.completedAt,
+      output: params.output,
+      reasoning: params.reasoning,
+      usedInputTokens: params.usedInputTokens,
+      usedOutputTokens: params.usedOutputTokens,
+      generationDurationMs: params.generationDurationMs,
+      providerDecodeDurationMs: params.providerDecodeDurationMs,
+      providerTokensPerSecond: params.providerTokensPerSecond,
+      ...(params.firstTokenAt ? { firstTokenAt: params.firstTokenAt } : {}),
+      estimateTokensFromText: this.estimateTokensFromText.bind(this),
+      ...(getLLMProviderName() === LLMProviders.Local && LLM_MANAGER.model
+        ? {
+            tokenizeLocally: (text: string): number =>
+              LLM_MANAGER.model.tokenize(text).length
+          }
+        : {})
+    })
+    this.totalInputTokens = observedMetrics.accumulator.totalInputTokens
+    this.totalOutputTokens = observedMetrics.accumulator.totalOutputTokens
+    this.totalVisibleOutputTokens =
+      observedMetrics.accumulator.totalVisibleOutputTokens
+    this.totalOutputChars = observedMetrics.accumulator.totalOutputChars
+    this.totalGenerationDurationMs =
+      observedMetrics.accumulator.totalGenerationDurationMs
+    this.phaseMetrics = observedMetrics.accumulator.phaseMetrics
+    this.finalAnswerMetrics = observedMetrics.accumulator.finalAnswerMetrics
+
+    this.logPromptUsage(
+      params.phase,
+      params.channel,
+      params.usedInputTokens ?? 0,
+      params.usedOutputTokens ?? 0
+    )
+    this.logPromptReasoning(params.phase, params.channel, params.reasoning)
+  }
+
   private logPromptReasoning(
     phase: ReactPhase,
     channel: 'json' | 'text' | 'tools',
@@ -2464,7 +2727,7 @@ export class ReActLLMDuty extends LLMDuty {
     prompt: string,
     systemPrompt: string,
     tools: OpenAITool[],
-    toolChoice: OpenAIToolChoice,
+    toolChoice: OpenAIToolChoice | undefined,
     history?: MessageLog[]
   ): Promise<void> {
     const promptTokens =
@@ -2475,12 +2738,14 @@ export class ReActLLMDuty extends LLMDuty {
     const totalEstimatedTokens =
       promptTokens + toolSchemaTokens + historyTokens
     const forcedChoice =
-      typeof toolChoice === 'string'
-        ? toolChoice
-        : `forced:${toolChoice.function.name}`
+      toolChoice === undefined
+        ? 'omitted'
+        : typeof toolChoice === 'string'
+          ? toolChoice
+          : `forced:${toolChoice.function.name}`
 
     const diagnosisMessage = BRAIN.wernicke('react.tool_call.diagnosis', '', {
-      '{{ provider }}': LLM_PROVIDER_NAME,
+      '{{ provider }}': getLLMProviderName(),
       '{{ tool_choice }}': forcedChoice,
       '{{ tool_count }}': String(tools.length),
       '{{ total_tokens }}': String(totalEstimatedTokens),
@@ -2547,6 +2812,26 @@ export class ReActLLMDuty extends LLMDuty {
       `Total tokens — input: ${this.totalInputTokens} | output: ${this.totalOutputTokens} | combined: ${this.totalInputTokens + this.totalOutputTokens}`
     )
 
+    const llmMetrics = deriveLLMMetrics({
+      providerName: getLLMProviderName(),
+      normalizedOutput,
+      totalInputTokens: this.totalInputTokens,
+      totalOutputTokens: this.totalOutputTokens,
+      totalVisibleOutputTokens: this.totalVisibleOutputTokens,
+      totalOutputChars: this.totalOutputChars,
+      totalGenerationDurationMs: this.totalGenerationDurationMs,
+      turnDurationMs: Math.max(Date.now() - this.executionStartedAt, 0),
+      phaseMetrics: this.phaseMetrics,
+      finalAnswerMetrics: this.finalAnswerMetrics,
+      estimateTokensFromText: this.estimateTokensFromText.bind(this),
+      ...(getLLMProviderName() === LLMProviders.Local && LLM_MANAGER.model
+        ? {
+            tokenizeLocally: (text: string): number =>
+              LLM_MANAGER.model.tokenize(text).length
+          }
+        : {})
+    })
+
     return {
       dutyType: LLMDuties.ReAct,
       systemPrompt: this.systemPrompt,
@@ -2555,6 +2840,7 @@ export class ReActLLMDuty extends LLMDuty {
       data: {
         hasExplicitMemoryWrite: this.hasExplicitMemoryWrite,
         finalIntent: this.finalResponseIntent,
+        llmMetrics,
         executionHistory: this.lastExecutionHistory.map((item) => ({
           function: item.function,
           status: item.status,
@@ -2591,7 +2877,7 @@ export class ReActLLMDuty extends LLMDuty {
 
     const chunks = token.match(/(\s+|[^\s]+)/g) || [token]
     for (const chunk of chunks) {
-      SOCKET_SERVER.socket?.emit('llm-reasoning-token', {
+      SOCKET_SERVER.emitToChatClients('llm-reasoning-token', {
         token: chunk,
         generationId,
         phase
@@ -2606,7 +2892,7 @@ export class ReActLLMDuty extends LLMDuty {
     this.hasStreamedTokenEmission = chunks.length > 0
 
     for (const token of chunks) {
-      SOCKET_SERVER.socket?.emit('llm-token', {
+      SOCKET_SERVER.emitToChatClients('llm-token', {
         token,
         generationId
       })

@@ -18,7 +18,8 @@ import {
   NVIDIA_NVSHMEM_PATH,
   NVIDIA_LIBS_PATH,
   PYTORCH_TORCH_PATH,
-  PYTHON_TCP_SERVER_BIN_PATH,
+  PYTHON_TCP_SERVER_ENTRY_PATH,
+  PYTHON_TCP_SERVER_RUNTIME_BIN_PATH,
   SHOULD_START_PYTHON_TCP_SERVER
 } from '@/constants'
 import {
@@ -41,7 +42,9 @@ import { Telemetry } from '@/telemetry'
 // import { ActionRecognitionLLMDuty } from '@/core/llm-manager/llm-duties/action-recognition-llm-duty'
 import { LangHelper } from '@/helpers/lang-helper'
 import { LogHelper } from '@/helpers/log-helper'
+import { RuntimeHelper } from '@/helpers/runtime-helper'
 import { SystemHelper } from '@/helpers/system-helper'
+import { CONFIG_STATE } from '@/core/config-states/config-state'
 ;(async (): Promise<void> => {
   process.title = 'leon'
   const shouldStartPythonTCPServer = SHOULD_START_PYTHON_TCP_SERVER
@@ -52,7 +55,7 @@ import { SystemHelper } from '@/helpers/system-helper'
     .filter(
       (p) =>
         (shouldStartPythonTCPServer &&
-          (p.cmd?.includes(PYTHON_TCP_SERVER_BIN_PATH) ||
+          (p.cmd?.includes(PYTHON_TCP_SERVER_ENTRY_PATH) ||
             // PyTorch thread from the TCP server (from binary, not from npm start:tcp-server command)
             (p.name?.includes('pt_main_thread') && !p.cmd?.includes('main.py')))) ||
         (p.cmd === process.title && p.pid !== process.pid)
@@ -78,9 +81,13 @@ import { SystemHelper } from '@/helpers/system-helper'
       '--nvidia-path',
       NVIDIA_LIBS_PATH
     ]
-    const tcpServerCmd = [PYTHON_TCP_SERVER_BIN_PATH, ...tcpServerArgs]
-      .map((arg) => `"${arg}"`)
-      .join(' ')
+    const tcpServerCommandArgs = [PYTHON_TCP_SERVER_ENTRY_PATH, ...tcpServerArgs]
+    const tcpServerCmd = RuntimeHelper.buildShellCommand(
+      PYTHON_TCP_SERVER_RUNTIME_BIN_PATH,
+      tcpServerCommandArgs
+    )
+    LogHelper.title('Python TCP Server')
+    LogHelper.info(`Running command: ${tcpServerCmd}`)
 
     const tcpServerEnv = { ...process.env }
 
@@ -102,11 +109,14 @@ import { SystemHelper } from '@/helpers/system-helper'
       tcpServerEnv['LD_LIBRARY_PATH'] = combinedLdPath
     }
 
-    global.pythonTCPServerProcess = spawn(tcpServerCmd, {
-      shell: true,
+    global.pythonTCPServerProcess = spawn(
+      PYTHON_TCP_SERVER_RUNTIME_BIN_PATH,
+      tcpServerCommandArgs,
+      {
       detached: IS_DEVELOPMENT_ENV,
       env: tcpServerEnv
-    })
+      }
+    )
     global.pythonTCPServerProcess.stdout.on('data', (data: Buffer) => {
       LogHelper.title('Python TCP Server')
       LogHelper.info(data.toString())
@@ -137,15 +147,44 @@ import { SystemHelper } from '@/helpers/system-helper'
   }
 
   try {
-    await LLM_PROVIDER.init()
+    // Start the HTTP server before heavyweight LLM startup so the client can
+    // render the initialization UI while local providers continue booting.
+    await HTTP_SERVER.init()
+  } catch (e) {
+    LogHelper.error(`HTTP server failed to init: ${e}`)
+  }
+
+  // Start the socket server as early as possible so init status events can
+  // flow to the client while the rest of Leon keeps booting.
+  await SOCKET_SERVER.init()
+  PULSE_MANAGER.start()
+
+  let isLLMProviderReady = false
+
+  try {
+    isLLMProviderReady = await LLM_PROVIDER.init()
   } catch (e) {
     LogHelper.error(`LLM Provider failed to init: ${e}`)
   }
 
-  try {
-    await LLM_MANAGER.loadLLM()
-  } catch (e) {
-    LogHelper.error(`LLM Manager failed to load: ${e}`)
+  if (isLLMProviderReady) {
+    try {
+      await LLM_MANAGER.init()
+    } catch (e) {
+      LogHelper.error(`LLM Manager failed to init: ${e}`)
+    }
+  } else {
+    const hasEnabledLLMTarget = CONFIG_STATE.getModelState().hasEnabledTarget()
+
+    if (hasEnabledLLMTarget) {
+      LogHelper.warning(
+        'Skipping LLM Manager init because the LLM provider is not ready'
+      )
+    } else {
+      LogHelper.info(
+        'Skipping LLM Manager init because no LLM is enabled yet'
+      )
+    }
   }
 
   try {
@@ -159,74 +198,6 @@ import { SystemHelper } from '@/helpers/system-helper'
   } catch (e) {
     LogHelper.error(`Context Manager failed to load: ${e}`)
   }
-
-  /*const actionRecognitionDuty = new ActionRecognitionLLMDuty({
-    input: 'Provide a number'
-  })
-  await actionRecognitionDuty.execute()*/
-
-  /*const customNERDuty = new CustomNERLLMDuty({
-    input:
-      'Add apples, 1L of milk, orange juice and tissues to the shopping list',
-    data: {
-      schema: {
-        items: {
-          type: 'array',
-          items: {
-            type: 'string'
-          }
-        },
-        list_name: {
-          type: 'string'
-        }
-      }
-    }
-  })
-  await customNERDuty.execute()*/
-
-  /*const summarizationDuty = new SummarizationLLMDuty({
-    input:
-      'We’ll be taking several important safety steps ahead of making Sora available in OpenAI’s products. We are working with red teamers domain experts in areas like misinformation, hateful content, and bias who will be adversarially testing the model.\n' +
-      '\n' +
-      'We’re also building tools to help detect misleading content such as a detection classifier that can tell when a video was generated by Sora. We plan to include C2PA metadata in the future if we deploy the model in an OpenAI product.\n' +
-      '\n' +
-      'In addition to us developing new techniques to prepare for deployment, we’re leveraging the existing safety methods that we built for our products that use DALL·E 3, which are applicable to Sora as well.\n' +
-      '\n' +
-      'For example, once in an OpenAI product, our text classifier will check and reject text input prompts that are in violation of our usage policies, like those that request extreme violence, sexual content, hateful imagery, celebrity likeness, or the IP of others. We’ve also developed robust image classifiers that are used to review the frames of every video generated to help ensure that it adheres to our usage policies, before it’s shown to the user.\n' +
-      '\n' +
-      'We’ll be engaging policymakers, educators and artists around the world to understand their concerns and to identify positive use cases for this new technology. Despite extensive research and testing, we cannot predict all of the beneficial ways people will use our technology, nor all the ways people will abuse it. That’s why we believe that learning from real-world use is a critical component of creating and releasing increasingly safe AI systems over time.'
-  })
-  await summarizationDuty.execute()*/
-
-  /*const paraphraseDuty = new ParaphraseLLMDuty({
-    input: 'I added your items to the shopping list.'
-  })
-  await paraphraseDuty.execute()*/
-
-  /*const translationDuty = new TranslationLLMDuty({
-    input: 'the weather is good in shenzhen',
-    data: {
-      // source: 'French',
-      target: 'French',
-      autoDetectLanguage: true
-    }
-  })
-  await translationDuty.execute()*/
-
-  try {
-    // Start the HTTP server
-    await HTTP_SERVER.init()
-  } catch (e) {
-    LogHelper.error(`HTTP server failed to init: ${e}`)
-  }
-
-  // TODO
-  // Register HTTP API endpoints
-  // await HTTP_API.register()
-
-  // Start the socket server
-  SOCKET_SERVER.init()
-  PULSE_MANAGER.start()
 
   // Check for updates on startup and every 24 hours
   if (IS_PRODUCTION_ENV) {
@@ -259,6 +230,8 @@ import { SystemHelper } from '@/helpers/system-helper'
     )
   }
   const shutdown = (exitCode = 0): void => {
+    LLM_PROVIDER.dispose()
+
     if (global.pythonTCPServerProcess?.pid) {
       kill(global.pythonTCPServerProcess.pid as number)
     }

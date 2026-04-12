@@ -9,14 +9,17 @@ import {
   STT_PROVIDER,
   TTS_PROVIDER,
   IS_TELEMETRY_ENABLED,
-  LLM_PROVIDER,
-  LEON_ROUTING_MODE,
   SHOULD_START_PYTHON_TCP_SERVER
 } from '@/constants'
-import { LLM_MANAGER, PERSONA } from '@/core'
+import { PERSONA } from '@/core'
 import { LogHelper } from '@/helpers/log-helper'
 import { DateHelper } from '@/helpers/date-helper'
 import { SystemHelper } from '@/helpers/system-helper'
+import { CONFIG_STATE } from '@/core/config-states/config-state'
+import {
+  getActiveLLMTarget,
+  getRoutingModeLLMDisplay
+} from '@/core/llm-manager/llm-routing'
 
 export const getInfo: FastifyPluginAsync<APIOptions> = async (
   fastify,
@@ -43,6 +46,21 @@ export const getInfo: FastifyPluginAsync<APIOptions> = async (
         SystemHelper.getFreeVRAM(),
         SystemHelper.getUsedVRAM()
       ])
+      const moodState = CONFIG_STATE.getMoodState()
+      const modelState = CONFIG_STATE.getModelState()
+      const routingMode = CONFIG_STATE.getRoutingModeState().getRoutingMode()
+      const workflowTarget = modelState.getWorkflowTarget()
+      const agentTarget = modelState.getAgentTarget()
+      const activeLLMTarget = getActiveLLMTarget(
+        routingMode,
+        workflowTarget,
+        agentTarget
+      )
+      const llmDisplay = getRoutingModeLLMDisplay(
+        routingMode,
+        workflowTarget,
+        agentTarget
+      )
 
       reply.send({
         success: true,
@@ -51,10 +69,6 @@ export const getInfo: FastifyPluginAsync<APIOptions> = async (
         message,
         after_speech: HAS_AFTER_SPEECH,
         telemetry: IS_TELEMETRY_ENABLED,
-        shouldWarmUpLLMDuties: LLM_MANAGER.shouldWarmUpLLMDuties,
-        isLLMActionRecognitionEnabled:
-          LLM_MANAGER.isLLMActionRecognitionEnabled,
-        isLLMNLGEnabled: LLM_MANAGER.isLLMNLGEnabled,
         timeZone: DateHelper.getTimeZone(),
         gpu: gpuDeviceNames[0],
         graphicsComputeAPI,
@@ -62,8 +76,20 @@ export const getInfo: FastifyPluginAsync<APIOptions> = async (
         freeVRAM,
         usedVRAM,
         llm: {
-          enabled: LLM_MANAGER.isLLMEnabled,
-          provider: LLM_PROVIDER
+          enabled: workflowTarget.isEnabled || agentTarget.isEnabled,
+          heading: llmDisplay.heading,
+          display: llmDisplay.value,
+          provider: activeLLMTarget.provider,
+          model: activeLLMTarget.model,
+          workflow: workflowTarget.label,
+          agent: agentTarget.label,
+          workflowEnabled: workflowTarget.isEnabled,
+          agentEnabled: agentTarget.isEnabled,
+          workflowProvider: workflowTarget.provider,
+          agentProvider: agentTarget.provider,
+          workflowModel: modelState.getWorkflowModelName(),
+          agentModel: modelState.getAgentModelName(),
+          localModel: modelState.getLocalModelName()
         },
         stt: {
           enabled: HAS_STT,
@@ -73,13 +99,14 @@ export const getInfo: FastifyPluginAsync<APIOptions> = async (
           enabled: HAS_TTS,
           provider: TTS_PROVIDER
         },
-        routingMode: LEON_ROUTING_MODE,
+        routingMode,
         tcpServer: {
           enabled: SHOULD_START_PYTHON_TCP_SERVER
         },
         mood: {
           type: PERSONA.mood.type,
-          emoji: PERSONA.mood.emoji
+          emoji: PERSONA.mood.emoji,
+          mode: moodState.getConfiguredMood()
         },
         version: LEON_VERSION
       })

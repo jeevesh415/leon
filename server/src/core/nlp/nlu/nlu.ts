@@ -6,7 +6,10 @@ import type {
   NLUResult
 } from '@/core/nlp/types'
 import type { SkillSchema } from '@/schemas/skill-schemas'
-import type { SkillAnswerCoreData } from '@/core/brain/types'
+import type {
+  BrainProcessResult,
+  SkillAnswerCoreData
+} from '@/core/brain/types'
 import {
   type ActionCallingMissingParamsOutput,
   type ActionCallingOutput,
@@ -40,12 +43,8 @@ import { SlotFillingLLMDuty } from '@/core/llm-manager/llm-duties/slot-filling-l
 import { ReActLLMDuty } from '@/core/llm-manager/llm-duties/react-llm-duty'
 import { LEON_ROUTING_MODE } from '@/constants'
 import { RoutingMode } from '@/types'
-
-// TODO: core rewrite delete?
-/*type MatchActionResult = Pick<
-  NLPJSProcessResult,
-  'locale' | 'sentiment' | 'answers' | 'intent' | 'domain' | 'score'
->*/
+import { CONFIG_STATE } from '@/core/config-states/config-state'
+import { WorkflowProgressWidget } from '@/core/nlp/nlu/workflow-progress-widget'
 
 // TODO: delete?
 export const DEFAULT_NLU_RESULT = {
@@ -53,8 +52,6 @@ export const DEFAULT_NLU_RESULT = {
   newUtterance: '',
   currentEntities: [],
   entities: [],
-  currentResolvers: [],
-  resolvers: [],
   slots: {},
   skillConfigPath: '',
   answers: [], // For dialog action type
@@ -70,6 +67,10 @@ export const DEFAULT_NLU_RESULT = {
 
 type RoutingRoute = 'workflow' | 'react'
 
+const NO_LLM_ENABLED_MESSAGE =
+  'I need an AI engine before I can answer. Enable local AI or configure an online provider.'
+const SYSTEM_WIDGET_HISTORY_MODE = 'system_widget'
+
 export default class NLU {
   private static instance: NLU
   // Used to store the current single-turn NLU process result
@@ -79,6 +80,10 @@ export default class NLU {
   public conversation = new Conversation('conv0')
   private hasHandledProviderFailure = false
   private _currentResponseRoute: RoutingRoute = 'workflow'
+  private workflowProgress = new WorkflowProgressWidget()
+  private pendingWorkflowNotFoundChoice: {
+    originalUtterance: NLPUtterance
+  } | null = null
 
   private readonly routingRoutes: Record<RoutingRoute, RoutingRoute> = {
     workflow: 'workflow',
@@ -111,17 +116,16 @@ export default class NLU {
       return
     }
 
-    const skillConfigPath = newNLUResult.skillConfigPath
-      ? newNLUResult.skillConfigPath
-      : SkillDomainHelper.getSkillConfigPath(
-          newNLUResult.classification.domain,
-          newNLUResult.classification.skill,
-          BRAIN.lang
-        )
-    const { actions } = await SkillDomainHelper.getSkillConfig(
-      skillConfigPath,
-      BRAIN.lang
+    const skillConfigPath =
+      newNLUResult.skillConfigPath ||
+      SkillDomainHelper.getNewSkillConfigPath(
+        newNLUResult.classification.skill
+      ) ||
+      ''
+    const skillConfig = await SkillDomainHelper.getNewSkillConfig(
+      newNLUResult.classification.skill
     )
+    const actions = skillConfig?.actions || {}
 
     this._nluResult = {
       ...newNLUResult,
@@ -141,8 +145,8 @@ export default class NLU {
     }
   }
 
-  private async handleProviderFailure(): Promise<boolean> {
-    const providerError = LLM_PROVIDER.consumeLastProviderErrorMessage()
+  private async handleProviderFailure(message?: string): Promise<boolean> {
+    const providerError = message || LLM_PROVIDER.consumeLastProviderErrorMessage()
 
     if (!providerError) {
       return false
@@ -155,6 +159,7 @@ export default class NLU {
       `Handled LLM provider failure locally: ${providerError}`
     )
 
+    this.workflowProgress.reset()
     this.conversation.cleanActiveState()
     await NLUProcessResultUpdater.update(DEFAULT_NLU_PROCESS_RESULT)
 
@@ -165,215 +170,44 @@ export default class NLU {
     return true
   }
 
-  // TODO: core rewrite delete?
-  /**
-   * Check if the utterance should break the action loop
-   * based on the active context and the utterance content
-   */
-  /*private shouldBreakActionLoop(utterance: NLPUtterance): boolean {
-    const loopStopWords = LangHelper.getActionLoopStopWords(BRAIN.lang)
-    const hasActiveContext = this.conversation.hasActiveContext()
-    const hasOnlyOneWord = utterance.split(' ').length === 1
-    const hasLessThan5Words = utterance.split(' ').length < 5
-    const hasStopWords = loopStopWords.some((word) =>
-      utterance.toLowerCase().includes(word)
-    )
-    const hasLoopWord = utterance.toLowerCase().includes('loop')
+  private startWorkflowProgressForTurn(
+    routingMode: RoutingMode,
+    hasPendingAction: boolean
+  ): void {
+    this.workflowProgress.startTurn(routingMode, hasPendingAction)
+  }
 
-    if (
-      (hasActiveContext && hasStopWords && hasOnlyOneWord) ||
-      (hasLessThan5Words && hasStopWords && hasLoopWord)
-    ) {
-      LogHelper.title('NLU')
-      LogHelper.info('Should break action loop')
-      return true
+  private emitDeferredSkillWidget(
+    processedData: Partial<BrainProcessResult>
+  ): void {
+    const lastOutputFromSkill = processedData.lastOutputFromSkill
+    const widget = lastOutputFromSkill?.widget
+
+    if (!widget || widget.historyMode === SYSTEM_WIDGET_HISTORY_MODE) {
+      return
     }
 
-    return false
-  }*/
-
-  // TODO: core rewrite delete?
-  /**
-   * Set new language; recreate a new TCP server with new language; and reprocess understanding
-   */
-  /*private async switchLanguage(
-    utterance: NLPUtterance,
-    locale: ShortLanguageCode
-  ): Promise<void> {
-    const connectedHandler = async (): Promise<void> => {
-      await this.process(utterance)
+    if (BRAIN.isMuted) {
+      return
     }
 
-    BRAIN.lang = locale
-    await BRAIN.talk(`${BRAIN.wernicke('random_language_switch')}.`, true)
-
-    // Recreate a new TCP server process and reconnect the TCP client
-    kill(global.pythonTCPServerProcess.pid as number, () => {
-      global.pythonTCPServerProcess = spawn(
-        `${PYTHON_TCP_SERVER_BIN_PATH} ${locale}`,
-        {
-          shell: true
-        }
-      )
-
-      PYTHON_TCP_CLIENT.connect()
-      PYTHON_TCP_CLIENT.ee.removeListener('connected', connectedHandler)
-      PYTHON_TCP_CLIENT.ee.on('connected', connectedHandler)
+    SOCKET_SERVER.emitAnswerToChatClients({
+      ...widget,
+      replaceMessageId: lastOutputFromSkill?.replaceMessageId || null
     })
-  }*/
-
-  // TODO: core rewrite delete?
-  /**
-   * Match the action based on the utterance.
-   * Fallback to chat action if no action is found
-   */
-  /*private async matchAction(
-    utterance: NLPUtterance
-  ): Promise<MatchActionResult> {
-    const socialConversationDomain = 'social_communication'
-    const chitChatSetupIntent = 'conversation.setup'
-    const nbWords = utterance.split(' ').length
-    /!**
-     * If considered as long utterance then force conversation.converse intent.
-     * Should go straight to the point when asking for a specific action without saying
-     * too much
-     *!/
-    const isConsideredLongUtterance = nbWords >= 12
-    let locale = null as unknown as NLPJSProcessResult['locale']
-    let sentiment
-    let answers = null as unknown as NLPJSProcessResult['answers']
-    let intent = null as unknown as NLPJSProcessResult['intent']
-    let domain = null as unknown as NLPJSProcessResult['domain']
-    let score = 1
-    let classifications =
-      null as unknown as NLPJSProcessResult['classifications']
-    let ownerHasExplicitlyRequestedChitChat = false
-
-    /!**
-     * Check if the owner has explicitly requested the chit-chat loop
-     *!/
-    const mainClassifierResult =
-      await MODEL_LOADER.mainNLPContainer.process(utterance)
-    if (
-      mainClassifierResult.domain === socialConversationDomain &&
-      mainClassifierResult.intent === chitChatSetupIntent
-    ) {
-      ownerHasExplicitlyRequestedChitChat = true
-    }
-
-    if (
-      LLM_MANAGER.isLLMActionRecognitionEnabled &&
-      !ownerHasExplicitlyRequestedChitChat
-    ) {
-      /!**
-       * Use LLM for action recognition
-       *!/
-
-      const dutyParams: ActionRecognitionLLMDutyParams = {
-        input: utterance,
-        data: {
-          existingContextName: null
-        }
-      }
-
-      if (this.conversation.hasActiveContext()) {
-        dutyParams.data.existingContextName =
-          this.conversation.activeContext.name
-      }
-
-      const actionRecognitionDuty = new ActionRecognitionLLMDuty(dutyParams)
-      await actionRecognitionDuty.init()
-      const actionRecognitionResult = await actionRecognitionDuty.execute()
-      const foundAction = actionRecognitionResult?.output[
-        'intent_name'
-      ] as string
-
-      locale = await MODEL_LOADER.mainNLPContainer.guessLanguage(utterance)
-      ;({ sentiment } =
-        await MODEL_LOADER.mainNLPContainer.getSentiment(utterance))
-
-      const chitChatSetupAction = `${socialConversationDomain}.${chitChatSetupIntent}`
-      /!**
-       * Check if the LLM did not find any action.
-       * Ignore the chit-chat setup action as it is a special case
-       *!/
-      const llmActionRecognitionDidNotFindAction =
-        isConsideredLongUtterance ||
-        !foundAction ||
-        foundAction === 'not_found' ||
-        foundAction === chitChatSetupAction
-      if (llmActionRecognitionDidNotFindAction) {
-        Telemetry.utterance({ utterance, lang: BRAIN.lang })
-
-        domain = socialConversationDomain
-        intent = 'conversation.converse'
-      } else {
-        // Check in case the LLM hallucinated an action
-        const actionExists = await SkillDomainHelper.actionExists(
-          locale,
-          foundAction
-        )
-
-        if (!actionExists) {
-          Telemetry.utterance({ utterance, lang: BRAIN.lang })
-
-          domain = socialConversationDomain
-          intent = 'conversation.converse'
-        } else {
-          const parsedAction = foundAction.split('.')
-          const [, skillName, actionName] = parsedAction
-
-          domain = parsedAction[0] as string
-          intent = `${skillName}.${actionName}`
-          answers = await MODEL_LOADER.mainNLPContainer.findAllAnswers(
-            locale,
-            intent
-          )
-        }
-      }
-    } else {
-      /!**
-       * Use classic NLP processing
-       *!/
-
-      ;({ locale, answers, score, intent, domain, sentiment, classifications } =
-        await MODEL_LOADER.mainNLPContainer.process(utterance))
-
-      /!**
-       * If a context is active, then use the appropriate classification based on score probability.
-       * E.g. 1. Create my shopping list; 2. Actually delete it.
-       * If there are several "delete it" across skills, Leon needs to make use of
-       * the current context ({domain}.{skill}) to define the most accurate classification
-       *!/
-      if (this.conversation.hasActiveContext()) {
-        classifications.forEach(({ intent: newIntent, score: newScore }) => {
-          if (newScore > 0.6) {
-            const [skillName] = newIntent.split('.')
-            const newDomain = MODEL_LOADER.mainNLPContainer.getIntentDomain(
-              locale,
-              newIntent
-            )
-            const contextName = `${newDomain}.${skillName}`
-            if (this.conversation.activeContext.name === contextName) {
-              score = newScore
-              intent = newIntent
-              domain = newDomain
-            }
-          }
-        })
-      }
-    }
-
-    return { locale, sentiment, answers, intent, domain, score }
-  }*/
+  }
 
   private async chooseSkill(utterance: NLPUtterance): Promise<NLPSkill | null> {
     LogHelper.title('NLU')
     LogHelper.info('Choosing skill...')
 
     try {
+      const skillRouterHistory = await CONVERSATION_LOGGER.load({
+        nbOfLogsToLoad: 6
+      })
       const skillRouterDuty = new SkillRouterLLMDuty({
-        input: utterance
+        input: utterance,
+        history: skillRouterHistory
       })
 
       await skillRouterDuty.init()
@@ -406,9 +240,27 @@ export default class NLU {
     LogHelper.info(`Choosing action for skill: ${skillName}...`)
 
     try {
+      const workflowContext = {
+        recentUtterances: this._nluProcessResult.context.utterances.slice(-4),
+        recentActionArguments:
+          this._nluProcessResult.context.actionArguments.slice(-4),
+        collectedParameters: this.conversation.activeState.collectedParameters,
+        recentEntities: this._nluProcessResult.context.entities
+          .slice(-8)
+          .map((entity) => ({
+            entity: entity.entity,
+            sourceText: entity.sourceText,
+            resolution: entity.resolution
+          }))
+      }
+      const actionCallingHistory = await CONVERSATION_LOGGER.load({
+        nbOfLogsToLoad: 6
+      })
       const actionCallingDuty = new ActionCallingLLMDuty({
         input: utterance,
-        skillName
+        skillName,
+        workflowContext,
+        history: actionCallingHistory
       })
 
       await actionCallingDuty.init()
@@ -536,7 +388,7 @@ export default class NLU {
           LogHelper.title('NLU')
           LogHelper.info(`Sending suggestions for action "${actionName}"`)
 
-          SOCKET_SERVER.socket?.emit('suggest', suggestions)
+          BRAIN.suggest(suggestions)
         }
       }
     } catch (e) {
@@ -620,6 +472,10 @@ export default class NLU {
               arguments: {}
             })
           } else {
+            // The current action is finished. Clear the workflow widget before
+            // waiting for the owner's input for the next action in the flow.
+            this.workflowProgress.completeAll()
+            this.workflowProgress.reset()
             await this.sendSuggestions()
           }
 
@@ -645,16 +501,29 @@ export default class NLU {
 
     const leonMode = this.getLeonMode()
     if (leonMode === RoutingMode.Workflow) {
+      this.workflowProgress.completeSelectionNotFound()
+      this.workflowProgress.reset()
       const utterance = this._nluProcessResult.new.utterance as NLPUtterance
       if (!utterance) {
         return
       }
 
-      if (!BRAIN.isMuted) {
-        await BRAIN.talk(BRAIN.wernicke('skill_not_found_offer_create'), true)
+      this.pendingWorkflowNotFoundChoice = {
+        originalUtterance: utterance
       }
 
-      await this.runSkillWriterCreateSkill(utterance)
+      if (!BRAIN.isMuted) {
+        await BRAIN.talk(
+          'I couldn\'t find a matching skill or action for this request. Do you want me to fall back to agent mode for it, write the code for a new skill, or cancel?',
+          true
+        )
+      }
+
+      BRAIN.suggest([
+        'Fallback to agent mode',
+        'Write the skill code',
+        'Cancel'
+      ])
       return
     }
 
@@ -662,6 +531,10 @@ export default class NLU {
       mode: leonMode,
       route: this.routingRoutes.react,
       reason: 'skill_not_found'
+    }
+    if (leonMode === RoutingMode.Smart) {
+      this.workflowProgress.completeRoutingOnly()
+      this.workflowProgress.reset()
     }
     LogHelper.title('NLU')
     LogHelper.info(
@@ -676,8 +549,75 @@ export default class NLU {
     // TODO: core rewrite chit-chat duty / or conversation skill?
   }
 
+  private async handlePendingWorkflowNotFoundChoice(
+    utterance: NLPUtterance
+  ): Promise<boolean> {
+    if (!this.pendingWorkflowNotFoundChoice) {
+      return false
+    }
+
+    const choiceDuty = new SlotFillingLLMDuty({
+      input: {
+        slotName: 'workflow_not_found_choice',
+        slotDescription:
+          'Return exactly one of these values: "fallback_to_agent" if the owner wants Leon to handle the original request via agent mode, "write_skill_code" if the owner wants Leon to write the code for a new skill, or "cancel" if the owner does not want either option.',
+        slotType: 'string',
+        latestUtterance: utterance,
+        recentUtterances: this._nluProcessResult.context.utterances.slice(-4)
+      },
+      startingUtterance: this.pendingWorkflowNotFoundChoice.originalUtterance
+    })
+
+    await choiceDuty.init()
+
+    const choiceResult = await choiceDuty.execute()
+    if (!choiceResult) {
+      await this.handleProviderFailure()
+      return true
+    }
+
+    const output = choiceResult.output as unknown as SlotFillingOutput
+    const choiceValue =
+      output.status === SlotFillingStatus.Success
+        ? String(output.filled_slots['workflow_not_found_choice'] || '')
+            .trim()
+            .toLowerCase()
+        : ''
+
+    const originalUtterance = this.pendingWorkflowNotFoundChoice.originalUtterance
+
+    if (choiceValue === 'fallback_to_agent') {
+      this.pendingWorkflowNotFoundChoice = null
+      await this.runReAct(originalUtterance)
+      return true
+    }
+
+    if (choiceValue === 'write_skill_code') {
+      this.pendingWorkflowNotFoundChoice = null
+      await this.runSkillWriterCreateSkill(originalUtterance)
+      return true
+    }
+
+    this.pendingWorkflowNotFoundChoice = null
+
+    if (choiceValue === 'cancel') {
+      if (!BRAIN.isMuted) {
+        await BRAIN.talk('Alright, cancelled.', true)
+      }
+
+      return true
+    }
+
+    if (!BRAIN.isMuted) {
+      await BRAIN.talk('Alright, cancelled.', true)
+    }
+
+    return true
+  }
+
   private getLeonMode(): RoutingMode {
-    const mode = String(LEON_ROUTING_MODE || RoutingMode.Smart).toLowerCase()
+    const runtimeRoutingMode = CONFIG_STATE.getRoutingModeState().getRoutingMode()
+    const mode = String(runtimeRoutingMode || RoutingMode.Smart).toLowerCase()
     if (
       mode === RoutingMode.Workflow ||
       mode === RoutingMode.Agent ||
@@ -688,7 +628,7 @@ export default class NLU {
 
     LogHelper.title('NLU')
     LogHelper.warning(
-      `Unknown LEON_ROUTING_MODE "${LEON_ROUTING_MODE}", defaulting to smart`
+      `Unknown LEON_ROUTING_MODE "${runtimeRoutingMode || LEON_ROUTING_MODE}", defaulting to smart`
     )
 
     return RoutingMode.Smart
@@ -733,6 +673,10 @@ export default class NLU {
         : {}
     const hasExplicitMemoryWrite =
       reactData['hasExplicitMemoryWrite'] === true
+    const llmMetrics =
+      reactData['llmMetrics'] && typeof reactData['llmMetrics'] === 'object'
+        ? (reactData['llmMetrics'] as Record<string, unknown>)
+        : null
     const finalIntent =
       typeof reactData['finalIntent'] === 'string'
         ? (reactData['finalIntent'] as
@@ -823,7 +767,71 @@ export default class NLU {
     }
 
     if (output && !BRAIN.isMuted) {
-      await BRAIN.talk(String(output), true)
+      await BRAIN.talk(
+        llmMetrics
+          ? {
+              text: String(output),
+              speech: String(output),
+              llmMetrics: {
+                inputTokens: Number(llmMetrics['inputTokens'] || 0),
+                outputTokens: Number(llmMetrics['outputTokens'] || 0),
+                totalTokens: Number(llmMetrics['totalTokens'] || 0),
+                finalAnswerOutputTokens: Number(
+                  llmMetrics['finalAnswerOutputTokens'] || 0
+                ),
+                durationMs: Number(llmMetrics['durationMs'] || 0),
+                finalAnswerDurationMs: Number(
+                  llmMetrics['finalAnswerDurationMs'] || 0
+                ),
+                finalAnswerTokensPerSecond: Number(
+                  llmMetrics['finalAnswerTokensPerSecond'] || 0
+                ),
+                finalAnswerCharsPerSecond: Number(
+                  llmMetrics['finalAnswerCharsPerSecond'] || 0
+                ),
+                outputCharsPerSecond: Number(
+                  llmMetrics['outputCharsPerSecond'] || 0
+                ),
+                averagedPhaseTokensPerSecond: Number(
+                  llmMetrics['averagedPhaseTokensPerSecond'] || 0
+                ),
+                ...(llmMetrics['phaseMetrics'] &&
+                typeof llmMetrics['phaseMetrics'] === 'object'
+                  ? {
+                      phaseMetrics: llmMetrics['phaseMetrics'] as {
+                        planning: {
+                          outputTokens: number
+                          durationMs: number
+                          tokensPerSecond: number
+                        }
+                        execution: {
+                          outputTokens: number
+                          durationMs: number
+                          tokensPerSecond: number
+                        }
+                        recovery: {
+                          outputTokens: number
+                          durationMs: number
+                          tokensPerSecond: number
+                        }
+                        final_answer: {
+                          outputTokens: number
+                          durationMs: number
+                          tokensPerSecond: number
+                        }
+                      }
+                    }
+                  : {}),
+                turnInputTokens: Number(llmMetrics['turnInputTokens'] || 0),
+                turnOutputTokens: Number(llmMetrics['turnOutputTokens'] || 0),
+                turnTotalTokens: Number(llmMetrics['turnTotalTokens'] || 0),
+                ttftMs: Number(llmMetrics['ttftMs'] || 0),
+                tokensPerSecond: Number(llmMetrics['tokensPerSecond'] || 0)
+              }
+            }
+          : String(output),
+        true
+      )
     }
   }
   private async runSkillWriterCreateSkill(
@@ -874,6 +882,8 @@ export default class NLU {
   private async handleActionSuccess(
     actionCallingOutput: ActionCallingSuccessOutput
   ): Promise<void> {
+    this.workflowProgress.startAction(actionCallingOutput.name)
+
     await NLUProcessResultUpdater.update({
       new: {
         actionArguments: actionCallingOutput.arguments
@@ -890,20 +900,22 @@ export default class NLU {
 
     const processedData = await BRAIN.runSkillAction(this._nluProcessResult)
 
-    console.log('processedData', processedData)
-    console.log('this._nluProcessResult', this._nluProcessResult)
-
     if (processedData.core?.should_stop_skill) {
       LogHelper.title('NLU')
       LogHelper.info('Received stop skill signal')
 
       this.conversation.cleanActiveState()
       await NLUProcessResultUpdater.update(DEFAULT_NLU_PROCESS_RESULT)
+      this.workflowProgress.completeAll()
+      this.workflowProgress.reset()
+      this.emitDeferredSkillWidget(processedData)
 
       return
     }
 
     if (processedData.core?.next_action) {
+      this.workflowProgress.completeAll()
+      this.emitDeferredSkillWidget(processedData)
       await this.jumpToNextAction(processedData.core.next_action)
 
       return
@@ -933,6 +945,9 @@ export default class NLU {
        * By returning here, we do not advance the flow.
        * The current action remains and ready for the next user input
        */
+      this.workflowProgress.completeAll()
+      this.workflowProgress.reset()
+      this.emitDeferredSkillWidget(processedData)
       return
     }
 
@@ -942,6 +957,7 @@ export default class NLU {
       const shouldContinueFlow = await this.handleSkillFlow(flow)
 
       if (shouldContinueFlow) {
+        this.emitDeferredSkillWidget(processedData)
         return
       }
     }
@@ -952,11 +968,16 @@ export default class NLU {
      */
     this.conversation.cleanActiveState()
     await NLUProcessResultUpdater.update(DEFAULT_NLU_PROCESS_RESULT)
+    this.workflowProgress.completeAll()
+    this.workflowProgress.reset()
+    this.emitDeferredSkillWidget(processedData)
   }
 
   private async handleActionMissingParams(
     actionCallingOutput: ActionCallingMissingParamsOutput
   ): Promise<void> {
+    this.workflowProgress.completeAll()
+
     LogHelper.title('NLU')
     LogHelper.warning(
       `Action calling missing params for: ${actionCallingOutput.name}`
@@ -986,6 +1007,8 @@ export default class NLU {
         true
       )
     }
+
+    this.workflowProgress.reset()
   }
 
   /**
@@ -995,6 +1018,7 @@ export default class NLU {
     const hasPendingAction = this.conversation.hasPendingAction()
 
     if (hasPendingAction) {
+      this.workflowProgress.showResolvingParameters()
       const [slotName] = this.conversation.activeState.missingParameters
       const actionConfig = this._nluProcessResult.actionConfig
       const param = actionConfig?.parameters?.[slotName as string]
@@ -1004,7 +1028,9 @@ export default class NLU {
         input: {
           slotName: slotName as string,
           slotDescription: paramDescription,
-          slotType: param.type
+          slotType: param.type || 'string',
+          latestUtterance: this._nluProcessResult.new.utterance || '',
+          recentUtterances: this._nluProcessResult.context.utterances.slice(-4)
         },
         startingUtterance: this.conversation.activeState
           .startingUtterance as string
@@ -1141,7 +1167,10 @@ export default class NLU {
    * and extract entities
    */
   public process(
-    utterance: NLPUtterance
+    utterance: NLPUtterance,
+    options?: {
+      ownerMessageId?: string
+    }
   ): Promise<NLUPartialProcessResult | null> {
     // TODO: core rewrite
     // const processingTimeStart = Date.now()
@@ -1157,7 +1186,11 @@ export default class NLU {
 
             await CONVERSATION_LOGGER.push({
               who: 'owner',
-              message: utterance
+              message: utterance,
+              isAddedToHistory: true,
+              ...(options?.ownerMessageId
+                ? { messageId: options.ownerMessageId }
+                : {})
             })
             void PULSE_MANAGER.observeOwnerUtterance(utterance).catch(
               (error: unknown) => {
@@ -1174,6 +1207,15 @@ export default class NLU {
               }
             })
 
+            const handledWorkflowNotFoundChoice =
+              await this.handlePendingWorkflowNotFoundChoice(utterance)
+            if (this.hasHandledProviderFailure) {
+              return resolve(null)
+            }
+            if (handledWorkflowNotFoundChoice) {
+              return resolve(null)
+            }
+
             const routingDecision = this.getRoutingDecision()
             LogHelper.title('NLU')
             LogHelper.info(
@@ -1181,8 +1223,24 @@ export default class NLU {
             )
 
             this._currentResponseRoute = routingDecision.route
+            const modelState = CONFIG_STATE.getModelState()
+            const isLLMDisabledForRoute =
+              (routingDecision.route === this.routingRoutes.react &&
+                !modelState.getAgentTarget().isEnabled) ||
+              (routingDecision.route === this.routingRoutes.workflow &&
+                !modelState.getWorkflowTarget().isEnabled)
+
+            if (isLLMDisabledForRoute) {
+              await this.handleProviderFailure(NO_LLM_ENABLED_MESSAGE)
+              return resolve(null)
+            }
+            this.startWorkflowProgressForTurn(
+              routingDecision.mode,
+              this.conversation.hasPendingAction()
+            )
             PERSONA.refreshContextInfo()
             if (routingDecision.route === this.routingRoutes.react) {
+              this.workflowProgress.reset()
               this.conversation.cleanActiveState()
               await NLUProcessResultUpdater.update(DEFAULT_NLU_PROCESS_RESULT)
               await this.runReAct(utterance)
@@ -1195,8 +1253,10 @@ export default class NLU {
             }
 
             if (shouldPickSkillAction) {
+              this.workflowProgress.showChoosingSkill()
               const chosenSkill = await this.chooseSkill(utterance)
               if (this.hasHandledProviderFailure) {
+                this.workflowProgress.reset()
                 return resolve(null)
               }
 
@@ -1204,6 +1264,8 @@ export default class NLU {
 
               if (!isSkillFound) {
                 if (routingDecision.mode === RoutingMode.Smart) {
+                  this.workflowProgress.completeRoutingOnly()
+                  this.workflowProgress.reset()
                   await this.runReAct(utterance)
                   return resolve(null)
                 }
@@ -1215,12 +1277,14 @@ export default class NLU {
               await NLUProcessResultUpdater.update({
                 skillName: chosenSkill
               })
+              this.workflowProgress.showPickingAction()
 
               const parsedActionCallingOutputs = await this.chooseSkillAction(
                 utterance,
                 chosenSkill
               )
               if (this.hasHandledProviderFailure) {
+                this.workflowProgress.reset()
                 return resolve(null)
               }
 
@@ -1241,229 +1305,15 @@ export default class NLU {
 
             // TODO: handle error in action calling
 
-            // TODO: core rewrite (need to measure processing time)
-            /*const processingTimeEnd = Date.now()
-            const processingTime = processingTimeEnd - processingTimeStart
-
-            resolve({
-              processingTime, // In ms, total time
-              ...processedData,
-              newUtterance: utterance,
-              nluProcessingTime:
-                processingTime - (processedData?.executionTime || 0) // In ms, NLU processing time only
-            })*/
-
-            //////////////////////////////////
-
-            // TODO: core rewrite delete?
-            /*if (!MODEL_LOADER.hasNlpModels()) {
-          if (!BRAIN.isMuted) {
-            await BRAIN.talk(`${BRAIN.wernicke('random_errors')}!`)
-          }
-
-          const msg =
-            'An NLP model is missing, please rebuild the project or if you are in dev run: npm run train'
-          LogHelper.error(msg)
-          return reject(msg)
-        }
-
-        if (this.shouldBreakActionLoop(utterance)) {
-          this.conversation.cleanActiveContext()
-
-          await BRAIN.talk(`${BRAIN.wernicke('action_loop_stopped')}.`, true)
-
-          return resolve({})
-        }
-
-        // Add spaCy entities
-        await NER.mergeSpacyEntities(utterance)
-
-        // Pre NLU processing according to the active context if there is one
-        if (this.conversation.hasActiveContext()) {
-          // When the active context is in an action loop, then directly trigger the action
-          if (this.conversation.activeContext.isInActionLoop) {
-            return resolve(await ActionLoop.handle(utterance))
-          }
-
-          // When the active context has slots filled
-          if (Object.keys(this.conversation.activeContext.slots).length > 0) {
-            try {
-              return resolve(await SlotFilling.handle(utterance))
-              // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            } catch (e) {
-              return reject({})
-            }
-          }
-        }
-
-        const { locale, sentiment, answers, intent, domain, score } =
-          await this.matchAction(utterance)
-
-        const [skillName, actionName] = intent.split('.')
-
-        await this.setNLUResult({
-          ...DEFAULT_NLU_RESULT, // Reset entities, slots, etc.
-          utterance,
-          newUtterance: utterance,
-          answers, // For dialog action type
-          sentiment,
-          classification: {
-            domain,
-            skill: skillName || '',
-            action: actionName || '',
-            confidence: score
-          }
-        })
-
-        const isSupportedLanguage = LangHelper.getShortCodes().includes(locale)
-        if (!isSupportedLanguage) {
-          await BRAIN.talk(
-            `${BRAIN.wernicke('random_language_not_supported')}.`,
-            true
-          )
-          return resolve({})
-        }
-
-        // Trigger language switching
-        if (BRAIN.lang !== locale) {
-          await this.switchLanguage(utterance, locale)
-          return resolve(null)
-        }
-
-        if (intent === 'None') {
-          const fallback = this.fallback(
-            LANG_CONFIGS[LangHelper.getLongCode(locale)].fallbacks
-          )
-
-          if (!fallback) {
-            if (!BRAIN.isMuted) {
-              await BRAIN.talk(
-                `${BRAIN.wernicke('random_unknown_intents_legacy')}.`,
-                true
-              )
-            }
-
-            LogHelper.title('NLU')
-            const msg = 'Intent not found'
-            LogHelper.warning(msg)
-
-            Telemetry.utterance({ utterance, lang: BRAIN.lang })
-
-            return resolve(null)
-          }
-
-          await this.setNLUResult(fallback)
-        }
-
-        LogHelper.title('NLU')
-        LogHelper.success(
-          `Intent found: ${this._nluResult.classification.skill}.${
-            this._nluResult.classification.action
-          } (domain: ${
-            this._nluResult.classification.domain
-          }); Confidence: ${this._nluResult.classification.confidence.toFixed(
-            2
-          )}`
-        )
-
-        const skillConfigPath = SkillDomainHelper.getSkillConfigPath(
-          this._nluResult.classification.domain,
-          this._nluResult.classification.skill,
-          BRAIN.lang
-        )
-        this._nluResult.skillConfigPath = skillConfigPath
-
-        try {
-          this._nluResult.entities = await NER.extractEntities(
-            BRAIN.lang,
-            skillConfigPath,
-            this._nluResult
-          )
-        } catch (e) {
-          LogHelper.error(`Failed to extract entities: ${e}`)
-        }
-
-        const shouldSlotLoop = await SlotFilling.route(intent, utterance)
-        if (shouldSlotLoop) {
-          return resolve({})
-        }
-
-        // In case all slots have been filled in the first utterance
-        if (
-          this.conversation.hasActiveContext() &&
-          Object.keys(this.conversation.activeContext.slots).length > 0
-        ) {
-          try {
-            return resolve(await SlotFilling.handle(utterance))
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-          } catch (e) {
-            return reject({})
-          }
-        }
-
-        const newContextName = `${this._nluResult.classification.domain}.${skillName}`
-        if (this.conversation.activeContext.name !== newContextName) {
-          this.conversation.cleanActiveContext()
-        }
-        await this.conversation.setActiveContext({
-          ...DEFAULT_ACTIVE_CONTEXT,
-          lang: BRAIN.lang,
-          slots: {},
-          isInActionLoop: false,
-          originalUtterance: this._nluResult.utterance,
-          newUtterance: utterance,
-          skillConfigPath: this._nluResult.skillConfigPath,
-          actionName: this._nluResult.classification.action,
-          domain: this._nluResult.classification.domain,
-          intent,
-          entities: this._nluResult.entities
-        })
-        // Pass current utterance entities to the NLU result object
-        this._nluResult.currentEntities =
-          this.conversation.activeContext.currentEntities
-        // Pass context entities to the NLU result object
-        this._nluResult.entities = this.conversation.activeContext.entities*/
-
             try {
               return resolve({})
-              // TODO: core rewrite
-              /*const processedData = await BRAIN.execute(this._nluResult)
-
-          // Prepare next action if there is one queuing
-          if (processedData.nextAction) {
-            this.conversation.cleanActiveContext()
-            await this.conversation.setActiveContext({
-              ...DEFAULT_ACTIVE_CONTEXT,
-              lang: BRAIN.lang,
-              slots: {},
-              isInActionLoop: !!processedData.nextAction.loop,
-              originalUtterance: processedData.utterance ?? '',
-              newUtterance: utterance ?? '',
-              skillConfigPath: processedData.skillConfigPath || '',
-              actionName: processedData.action?.next_action || '',
-              domain: processedData.classification?.domain || '',
-              intent: `${processedData.classification?.skill}.${processedData.action?.next_action}`,
-              entities: []
-            })
-          }
-
-          const processingTimeEnd = Date.now()
-          const processingTime = processingTimeEnd - processingTimeStart
-
-          return resolve({
-            processingTime, // In ms, total time
-            ...processedData,
-            newUtterance: utterance,
-            nluProcessingTime:
-              processingTime - (processedData?.executionTime || 0) // In ms, NLU processing time only
-          })*/
             } catch (e) {
               const errorMessage = `Failed to execute action: ${e}`
 
               LogHelper.error(errorMessage)
 
               if (!BRAIN.isMuted) {
-                SOCKET_SERVER.socket?.emit('is-typing', false)
+                SOCKET_SERVER.emitToChatClients('is-typing', false)
               }
 
               return reject(new Error(errorMessage))
@@ -1475,41 +1325,4 @@ export default class NLU {
         })
     )
   }
-
-  // TODO: core rewrite delete?
-  /**
-   * Pickup and compare the right fallback
-   * according to the wished skill action
-   */
-  /*private fallback(fallbacks: Language['fallbacks']): NLUResult | null {
-    const words = this._nluResult.utterance.toLowerCase().split(' ')
-
-    if (fallbacks.length > 0) {
-      LogHelper.info('Looking for fallbacks...')
-      const tmpWords = []
-
-      for (let i = 0; i < fallbacks.length; i += 1) {
-        for (let j = 0; j < fallbacks[i]!.words.length; j += 1) {
-          if (words.includes(fallbacks[i]!.words[j] as string)) {
-            tmpWords.push(fallbacks[i]?.words[j])
-          }
-        }
-
-        if (JSON.stringify(tmpWords) === JSON.stringify(fallbacks[i]?.words)) {
-          this._nluResult.entities = []
-          this._nluResult.classification.domain = fallbacks[i]
-            ?.domain as NLPDomain
-          this._nluResult.classification.skill = fallbacks[i]?.skill as NLPSkill
-          this._nluResult.classification.action = fallbacks[i]
-            ?.action as NLPAction
-          this._nluResult.classification.confidence = 1
-
-          LogHelper.success('Fallback found')
-          return this._nluResult
-        }
-      }
-    }
-
-    return null
-  }*/
 }
