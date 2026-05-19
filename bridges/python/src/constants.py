@@ -4,6 +4,10 @@ import os
 
 import version
 
+DEFAULT_LEON_PROFILE = "just-me"
+LEON_HOME_DIRNAME = ".leon"
+
+
 argv = sys.argv[1:]
 if "--runtime" in argv:
     runtime_index = argv.index("--runtime")
@@ -20,18 +24,40 @@ if not INTENT_OBJ_FILE_PATH:
 with open(INTENT_OBJ_FILE_PATH, "r", encoding="utf-8") as f:
     INTENT_OBJECT = json.load(f)
 
-SKILLS_ROOT_PATH = os.path.join(os.getcwd(), "skills")
-BIN_PATH = os.path.join(os.getcwd(), "bin")
-BRIDGES_PATH = os.path.join(os.getcwd(), "bridges")
+CODEBASE_PATH = os.path.abspath(
+    os.getenv("LEON_CODEBASE_PATH", "").strip() or os.getcwd()
+)
+LEON_HOME_PATH = os.path.abspath(
+    os.getenv("LEON_HOME", "").strip()
+    or os.path.join(os.path.expanduser("~"), LEON_HOME_DIRNAME)
+)
+LEON_PROFILE_NAME = os.getenv("LEON_PROFILE", "").strip() or DEFAULT_LEON_PROFILE
+LEON_PROFILES_PATH = os.path.join(LEON_HOME_PATH, "profiles")
+LEON_PROFILE_PATH = os.path.join(LEON_PROFILES_PATH, LEON_PROFILE_NAME)
+LEON_TOOLKITS_PATH = os.path.join(LEON_HOME_PATH, "toolkits")
+PROFILE_CONTEXT_PATH = os.path.join(LEON_PROFILE_PATH, "context")
+PROFILE_MEMORY_PATH = os.path.join(LEON_PROFILE_PATH, "memory")
+PROFILE_MEMORY_DB_PATH = os.path.join(PROFILE_MEMORY_PATH, "index.sqlite")
+PROFILE_SKILLS_PATH = os.path.join(LEON_PROFILE_PATH, "skills")
+PROFILE_NATIVE_SKILLS_PATH = os.path.join(PROFILE_SKILLS_PATH, "native")
+PROFILE_AGENT_SKILLS_PATH = os.path.join(PROFILE_SKILLS_PATH, "agent")
+PROFILE_TOOLS_PATH = os.path.join(LEON_PROFILE_PATH, "tools")
+PROFILE_DISABLED_PATH = os.path.join(LEON_PROFILE_PATH, "disabled.json")
+PROFILE_ALLOWED_PATH = os.path.join(LEON_PROFILE_PATH, "allowed.json")
+
+SKILLS_ROOT_PATH = os.path.join(CODEBASE_PATH, "skills")
+NATIVE_SKILLS_PATH = os.path.join(SKILLS_ROOT_PATH, "native")
+AGENT_SKILLS_PATH = os.path.join(SKILLS_ROOT_PATH, "agent")
+TOOLS_PATH = os.path.join(CODEBASE_PATH, "tools")
+BIN_PATH = os.path.join(LEON_HOME_PATH, "bin")
+BRIDGES_PATH = os.path.join(CODEBASE_PATH, "bridges")
 
 NVIDIA_LIBS_PATH = os.path.join(BIN_PATH, "nvidia")
 
 PYTORCH_PATH = os.path.join(BIN_PATH, "pytorch")
 PYTORCH_TORCH_PATH = os.path.join(PYTORCH_PATH, "torch")
 
-TOOLKITS_PATH = os.path.join(BRIDGES_PATH, "toolkits")
-
-SKILL_PATH = os.path.join(SKILLS_ROOT_PATH, INTENT_OBJECT["skill_name"])
+SKILL_PATH = os.path.dirname(INTENT_OBJECT["skill_config_path"])
 
 SKILLS_PATH = SKILLS_ROOT_PATH
 

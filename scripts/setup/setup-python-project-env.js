@@ -94,7 +94,7 @@ export async function getPyprojectDependencies(projectPath) {
 /**
  * Resolve the Python executable path inside a project-local `.venv`.
  */
-function getProjectVenvPythonPath(projectPath) {
+export function getProjectVenvPythonPath(projectPath) {
   return path.join(
     projectPath,
     '.venv',
@@ -110,7 +110,11 @@ async function isSyncCurrent(projectPath, stampFileName) {
   const pyprojectPath = path.join(projectPath, PYPROJECT_FILE_NAME)
   const stampPath = path.join(projectPath, stampFileName)
 
-  if (!fs.existsSync(pyprojectPath) || !fs.existsSync(stampPath)) {
+  if (
+    !fs.existsSync(pyprojectPath) ||
+    !fs.existsSync(stampPath) ||
+    !fs.existsSync(getProjectVenvPythonPath(projectPath))
+  ) {
     return false
   }
 

@@ -1,11 +1,9 @@
 import path from 'node:path'
-import url from 'node:url'
-import { createRequire, registerHooks } from 'node:module'
 
 import { FileHelper } from '@/helpers/file-helper'
 
 import type { ActionFunction, ActionParams } from '@sdk/types'
-import { INTENT_OBJECT } from '@bridge/constants'
+import { INTENT_OBJECT, SKILL_PATH } from '@bridge/constants'
 import { ParamsHelper } from '@sdk/params-helper'
 import { leon } from '@sdk/leon'
 import { setToolReporter } from '@sdk/tool-reporter'
@@ -37,59 +35,7 @@ const resolveActionFunction = (actionModule: unknown): ActionFunction | null => 
   return null
 }
 
-const isBarePackageImport = (specifier: string): boolean => {
-  return !specifier.startsWith('.') &&
-    !specifier.startsWith('/') &&
-    !specifier.startsWith('node:') &&
-    !specifier.startsWith('file:')
-}
-
-const isLeonAliasImport = (specifier: string): boolean => {
-  return specifier.startsWith('@/') ||
-    specifier.startsWith('@bridge/') ||
-    specifier.startsWith('@sdk/') ||
-    specifier.startsWith('@@/')
-}
-
-const registerSkillRuntimeNodeModules = (skillName: string): void => {
-  const skillPath = path.join(process.cwd(), 'skills', skillName)
-  const runtimeNodeModulesPath = path.join(
-    skillPath,
-    '.runtime',
-    'node_modules'
-  )
-
-  if (!FileHelper.isExistingPath(runtimeNodeModulesPath)) {
-    return
-  }
-
-  const runtimeRequire = createRequire(
-    path.join(runtimeNodeModulesPath, '__resolver__.cjs')
-  )
-
-  // Keep Leon aliases and relative imports on the default path, and only
-  // redirect bare package imports to the skill-local runtime dependencies.
-  registerHooks({
-    resolve(specifier, context, nextResolve) {
-      if (!isBarePackageImport(specifier) || isLeonAliasImport(specifier)) {
-        return nextResolve(specifier, context)
-      }
-
-      try {
-        const resolvedPath = runtimeRequire.resolve(specifier)
-
-        return {
-          shortCircuit: true,
-          url: url.pathToFileURL(resolvedPath).href
-        }
-      } catch {
-        return nextResolve(specifier, context)
-      }
-    }
-  })
-}
-
-;(async (): Promise<void> => {
+async function main(): Promise<void> {
   setToolReporter(async (input) => {
     await leon.answer(input)
   })
@@ -103,8 +49,6 @@ const registerSkillRuntimeNodeModules = (skillName: string): void => {
     skill_config_path,
     extra_context
   } = INTENT_OBJECT
-
-  registerSkillRuntimeNodeModules(skill_name)
 
   const params: ActionParams = {
     lang,
@@ -125,9 +69,7 @@ const registerSkillRuntimeNodeModules = (skillName: string): void => {
   try {
     const actionModule = await FileHelper.dynamicImportFromFile(
       path.join(
-        process.cwd(),
-        'skills',
-        skill_name,
+        SKILL_PATH,
         'src',
         'actions',
         `${action_name}.ts`
@@ -150,4 +92,6 @@ const registerSkillRuntimeNodeModules = (skillName: string): void => {
       e
     )
   }
-})()
+}
+
+void main()

@@ -13,6 +13,7 @@ const REPLACED_MESSAGES = new Set()
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 24
 const MAXIMUM_BUBBLES_IN_MEMORY = 62
 const MAXIMUM_WIDGET_FETCH_CONCURRENCY = 4
+const SECONDS_PER_MINUTE = 60
 
 function escapeHTML(value) {
   return String(value || '')
@@ -24,9 +25,10 @@ function escapeHTML(value) {
 }
 
 export default class Chatbot {
-  constructor(socket, serverURL) {
+  constructor(socket, serverURL, sessionId = null) {
     this.socket = socket
     this.serverURL = serverURL
+    this.sessionId = sessionId
     this.et = new EventTarget()
     this.feed = document.querySelector('#feed')
     this.typing = document.querySelector('#is-typing')
@@ -260,7 +262,7 @@ export default class Chatbot {
       }
 
       const data = await axios.get(
-        `${this.serverURL}/api/v1/fetch-widget?skill_action=${widgetContainer.onFetch.actionName}&widget_id=${widgetContainer.widgetId}`
+        `${this.serverURL}/api/v1/fetch-widget?skill_action=${widgetContainer.onFetch.actionName}&widget_id=${widgetContainer.widgetId}${this.sessionId ? `&session_id=${encodeURIComponent(this.sessionId)}` : ''}`
       )
       const fetchedWidget = data.data.widget
       const reactNode = fetchedWidget
@@ -320,14 +322,38 @@ export default class Chatbot {
     return this.widgetHydrationPromise
   }
 
+  setSessionId(sessionId) {
+    this.sessionId = sessionId
+  }
+
+  resetFeed() {
+    WIDGETS_TO_FETCH.length = 0
+    this.feed.innerHTML = ''
+    this.noBubbleMessage = document.createElement('p')
+    this.noBubbleMessage.id = 'no-bubble'
+    this.noBubbleMessage.className = 'hide'
+    this.noBubbleMessage.textContent =
+      'You can start to interact with me, don\'t be shy.'
+    this.feed.appendChild(this.noBubbleMessage)
+    this.parsedBubbles = []
+    this.reasoningBlocks.clear()
+    this.feedAutoScrollEnabled = true
+  }
+
   async loadFeed() {
     WIDGETS_TO_FETCH.length = 0
+    this.resetFeed()
+    const sessionQuery = this.sessionId
+      ? `&session_id=${encodeURIComponent(this.sessionId)}`
+      : ''
 
     const [historyResponse, systemWidgetsResponse] = await Promise.all([
       axios.get(
-        `${this.serverURL}/api/v1/conversation-history?supports_widgets=true`
+        `${this.serverURL}/api/v1/conversation-history?supports_widgets=true${sessionQuery}`
       ),
-      axios.get(`${this.serverURL}/api/v1/system-widgets?supports_widgets=true`)
+      axios.get(
+        `${this.serverURL}/api/v1/system-widgets?supports_widgets=true${sessionQuery}`
+      )
     ])
     const history = Array.isArray(historyResponse.data?.history)
       ? historyResponse.data.history
@@ -745,6 +771,20 @@ export default class Chatbot {
     `.trim()
   }
 
+  formatTurnDuration(durationMs) {
+    const durationSeconds = Number(durationMs || 0) / 1_000
+    const roundedDurationSeconds = Math.max(0, Number(durationSeconds.toFixed(1)))
+
+    if (roundedDurationSeconds < SECONDS_PER_MINUTE) {
+      return `${roundedDurationSeconds.toFixed(1)}s`
+    }
+
+    const minutes = Math.floor(roundedDurationSeconds / SECONDS_PER_MINUTE)
+    const seconds = roundedDurationSeconds % SECONDS_PER_MINUTE
+
+    return `${minutes}m${seconds.toFixed(1)}s`
+  }
+
   formatMetrics(metrics, sentAt = null) {
     if (!metrics) {
       return ''
@@ -753,7 +793,7 @@ export default class Chatbot {
     const inputTokens = Number(metrics.inputTokens || 0)
     const outputTokens = Number(metrics.outputTokens || 0)
     const totalTokens = Number(metrics.totalTokens || inputTokens + outputTokens)
-    const durationSeconds = Number(metrics.durationMs || 0) / 1_000
+    const turnDuration = this.formatTurnDuration(metrics.durationMs)
     const tokensPerSecond = Number(
       metrics.tokensPerSecond || metrics.averagedPhaseTokensPerSecond || 0
     )
@@ -767,7 +807,7 @@ export default class Chatbot {
       </span>
       <span class="bubble-metric-item">
         <i class="ri-timer-flash-line" aria-hidden="true"></i>
-        <span>${durationSeconds.toFixed(1)}s</span>
+        <span>${turnDuration}</span>
       </span>
       <span class="bubble-metric-item">
         <i class="ri-flashlight-line" aria-hidden="true"></i>

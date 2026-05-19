@@ -6,15 +6,16 @@ import { INIT_MESSAGES } from './constants'
 import handleSuggestions from './suggestion-handler.js'
 
 export default class Client {
-  constructor(client, serverUrl, input) {
+  constructor(client, serverUrl, input, options = {}) {
     this.client = client
     this._input = input
     this.voiceSpeechElement = document.querySelector('#voice-speech')
     this.serverUrl = serverUrl
     this.socket = io(this.serverUrl)
+    this.activeSessionId = options.activeSessionId || null
     this.history = localStorage.getItem('history')
     this.parsedHistory = []
-    this.chatbot = new Chatbot(this.socket, this.serverUrl)
+    this.chatbot = new Chatbot(this.socket, this.serverUrl, this.activeSessionId)
     this.voiceEnergy = new VoiceEnergy(this)
     this._recorder = {}
     this._suggestions = []
@@ -55,6 +56,22 @@ export default class Client {
 
     moodContainer.textContent = `Leon's mood: ${mood.emoji}`
     moodContainer.setAttribute('title', mood.type)
+  }
+
+  setSessionPanel(sessionPanel) {
+    this.sessionPanel = sessionPanel
+  }
+
+  async setActiveSession(sessionId) {
+    if (!sessionId || sessionId === this.activeSessionId) {
+      return
+    }
+
+    this.activeSessionId = sessionId
+    this.chatbot.setSessionId(sessionId)
+    this.socket.emit('session-change', sessionId)
+    await this.chatbot.loadFeed()
+    this.chatbot.scrollDown({ force: true })
   }
 
   async sendInitMessages() {
@@ -140,6 +157,7 @@ export default class Client {
     this.socket.on('connect', () => {
       this.socket.emit('init', {
         client: this.client,
+        sessionId: this.activeSessionId,
         capabilities: {
           supportsWidgets: true
         }
@@ -286,6 +304,7 @@ export default class Client {
 
       this._activeStreamGenerationId = null
       this._answerGenerationId = 'xxx'
+      void this.sessionPanel?.refresh()
     })
 
     this.socket.on('suggest', (data) => {
@@ -509,32 +528,46 @@ export default class Client {
   }
 
   send(keyword) {
-    // Prevent from sending utterance if Leon is still generating text (stream)
-    if (keyword === 'utterance' && this._isLeonGeneratingAnswer) {
-      return false
-    }
-
-    if (this._input.value !== '') {
-      const sentAt = Date.now()
-
-      this.socket.emit(keyword, {
-        client: this.client,
-        value: this._input.value.trim(),
-        sentAt
-      })
-      this.chatbot.sendTo('leon', this._input.value, sentAt)
-      this.chatbot.scrollDown({ force: true })
-
-      this.save()
-
-      return true
+    if (keyword === 'utterance') {
+      return this.sendUtterance(this._input.value)
     }
 
     return false
   }
 
-  save() {
-    let val = this._input.value
+  sendUtterance(value, options = {}) {
+    if (this._isLeonGeneratingAnswer) {
+      return false
+    }
+
+    const trimmedValue = String(value || '').trim()
+
+    if (trimmedValue === '') {
+      return false
+    }
+
+    const sentAt =
+      typeof options.sentAt === 'number' ? options.sentAt : Date.now()
+
+    this.socket.emit('utterance', {
+      client: this.client,
+      value: trimmedValue,
+      sentAt,
+      sessionId: this.activeSessionId,
+      ...(options.commandContext
+        ? { commandContext: options.commandContext }
+        : {})
+    })
+    this.chatbot.sendTo('leon', trimmedValue, sentAt)
+    this.chatbot.scrollDown({ force: true })
+
+    this.save(trimmedValue)
+
+    return true
+  }
+
+  save(value = this._input.value) {
+    let val = value
 
     if (localStorage.getItem('history') === null) {
       localStorage.setItem('history', JSON.stringify([]))

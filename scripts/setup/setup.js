@@ -1,4 +1,22 @@
-import { IS_GITHUB_ACTIONS } from '@/constants'
+import fs from 'node:fs'
+
+import {
+  CACHE_PATH,
+  LEON_HOME_PATH,
+  LEON_PROFILES_PATH,
+  LEON_PROFILE_PATH,
+  LEON_TOOLKITS_PATH,
+  MODELS_PATH,
+  PROFILE_CONTEXT_PATH,
+  PROFILE_AGENT_SKILLS_PATH,
+  PROFILE_LOGS_PATH,
+  PROFILE_MEMORY_PATH,
+  PROFILE_NATIVE_SKILLS_PATH,
+  PROFILE_SKILLS_PATH,
+  PROFILE_TOOLS_PATH,
+  TMP_PATH,
+  IS_GITHUB_ACTIONS
+} from '@/constants'
 import { LogHelper } from '@/helpers/log-helper'
 import { NetworkHelper } from '@/helpers/network-helper'
 
@@ -8,10 +26,9 @@ import train from '../train/train'
 import generateHTTPAPIKey from '../generate/generate-http-api-key'
 import generateJSONSchemas from '../generate/generate-json-schemas'
 
-import setupDotenv, {
-  readDotEnvVariables,
-  updateDotEnvVariable
-} from './setup-dotenv'
+import setupDotenv, { updateDotEnvVariable } from './setup-dotenv'
+import setupConfig from './setup-config'
+import { CONFIG_MANAGER } from '@/config'
 import setupCore from './setup-core'
 import setupNode from './setup-node'
 import setupPNPM from './setup-pnpm'
@@ -20,6 +37,8 @@ import setupPython from './setup-python'
 import setupUV from './setup-uv'
 import setupNodejsBridgeEnv from './setup-nodejs-bridge-env'
 import setupPythonBridgeEnv from './setup-python-bridge-env'
+import setupToolsDependencies from './setup-tools-dependencies'
+import setupToolsSettings from './setup-tools-settings'
 import setupSkills from './setup-skills/setup-skills'
 import setupTCPServerEnv from './setup-tcp-server-env'
 import setupCMake from './setup-cmake'
@@ -31,7 +50,10 @@ import setupNVIDIALibs from './setup-nvidia-libs.js'
 import setupPyTorch from './setup-pytorch.js'
 import setupTCPServerModels from './setup-tcp-server-models'
 import inspectLocalAICapability from './local-ai-capability'
-import inspectVoiceSetupState from './inspect-voice-setup-state'
+import {
+  inspectLocalAISetupState,
+  inspectVoiceSetupState
+} from './inspect-setup-state'
 import postSetup from './post-setup'
 import { printSetupBanner } from './setup-banner'
 import { tellSetupCompletionJoke } from './setup-jokes'
@@ -42,7 +64,33 @@ import createInstanceID from './create-instance-id'
 import setFfprobePermissions from './set-ffprobe-permissions'
 import setupGitHooks from './setup-git-hooks'
 
-const DISABLED_LLM_TARGET_VALUE = 'none'
+const LOCAL_LLM_TARGET_VALUE = 'llamacpp'
+
+/**
+ * Create Leon home directories that setup and runtime expect to exist.
+ */
+async function ensureLeonHomeStructure() {
+  const status = createSetupStatus('Preparing Leon home...').start()
+
+  await Promise.all([
+    fs.promises.mkdir(LEON_HOME_PATH, { recursive: true }),
+    fs.promises.mkdir(LEON_PROFILES_PATH, { recursive: true }),
+    fs.promises.mkdir(LEON_PROFILE_PATH, { recursive: true }),
+    fs.promises.mkdir(CACHE_PATH, { recursive: true }),
+    fs.promises.mkdir(LEON_TOOLKITS_PATH, { recursive: true }),
+    fs.promises.mkdir(MODELS_PATH, { recursive: true }),
+    fs.promises.mkdir(TMP_PATH, { recursive: true }),
+    fs.promises.mkdir(PROFILE_CONTEXT_PATH, { recursive: true }),
+    fs.promises.mkdir(PROFILE_MEMORY_PATH, { recursive: true }),
+    fs.promises.mkdir(PROFILE_LOGS_PATH, { recursive: true }),
+    fs.promises.mkdir(PROFILE_SKILLS_PATH, { recursive: true }),
+    fs.promises.mkdir(PROFILE_NATIVE_SKILLS_PATH, { recursive: true }),
+    fs.promises.mkdir(PROFILE_AGENT_SKILLS_PATH, { recursive: true }),
+    fs.promises.mkdir(PROFILE_TOOLS_PATH, { recursive: true })
+  ])
+
+  status.succeed('Leon home: ready')
+}
 
 function isExplicitLocalLLMTarget(value) {
   const normalizedValue = (value || '').trim()
@@ -54,16 +102,15 @@ function isExplicitLocalLLMTarget(value) {
   )
 }
 
+function getOptionalLLMTarget(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
 async function resolveExistingLLMChoice() {
-  const llmEnvValues = await readDotEnvVariables([
-    'LEON_LLM',
-    'LEON_WORKFLOW_LLM',
-    'LEON_AGENT_LLM'
-  ])
-  const hasGlobalLLMSetting = Object.hasOwn(llmEnvValues, 'LEON_LLM')
-  const leonLLM = (llmEnvValues['LEON_LLM'] || '').trim()
-  const leonWorkflowLLM = (llmEnvValues['LEON_WORKFLOW_LLM'] || '').trim()
-  const leonAgentLLM = (llmEnvValues['LEON_AGENT_LLM'] || '').trim()
+  const llmConfig = CONFIG_MANAGER.getConfig().llm
+  const leonLLM = getOptionalLLMTarget(llmConfig.default)
+  const leonWorkflowLLM = getOptionalLLMTarget(llmConfig.workflow)
+  const leonAgentLLM = getOptionalLLMTarget(llmConfig.agent)
   const overrideTargets = [leonWorkflowLLM, leonAgentLLM].filter(Boolean)
 
   if (overrideTargets.length > 0) {
@@ -72,39 +119,44 @@ async function resolveExistingLLMChoice() {
       setupLocalAI: overrideTargets.some((target) =>
         isExplicitLocalLLMTarget(target)
       ),
+      targetType: overrideTargets.some((target) =>
+        isExplicitLocalLLMTarget(target)
+      )
+        ? 'explicitLocal'
+        : 'remote',
       label: overrideTargets.join(', ')
     }
   }
 
-  if (!hasGlobalLLMSetting || leonLLM === DISABLED_LLM_TARGET_VALUE) {
+  if (leonLLM === '') {
     return {
       hasResolvedChoice: false,
       setupLocalAI: false,
+      targetType: 'disabled',
       label: ''
     }
   }
 
   return {
     hasResolvedChoice: true,
-    setupLocalAI: leonLLM === '' || isExplicitLocalLLMTarget(leonLLM),
-    label: leonLLM === '' ? 'Local AI' : leonLLM
+    setupLocalAI: isExplicitLocalLLMTarget(leonLLM),
+    targetType: isExplicitLocalLLMTarget(leonLLM)
+      ? 'explicitLocal'
+      : 'remote',
+    label: leonLLM
   }
 }
 
 async function syncLLMSetupChoice(preferences) {
-  const llmEnvValues = await readDotEnvVariables([
-    'LEON_LLM',
-    'LEON_WORKFLOW_LLM',
-    'LEON_AGENT_LLM',
-    preferences.remoteLLMAPIKeyEnv
-  ])
-  const leonLLM = (llmEnvValues['LEON_LLM'] || '').trim()
-  const leonWorkflowLLM = (llmEnvValues['LEON_WORKFLOW_LLM'] || '').trim()
-  const leonAgentLLM = (llmEnvValues['LEON_AGENT_LLM'] || '').trim()
+  CONFIG_MANAGER.reload()
+  const llmConfig = CONFIG_MANAGER.getConfig().llm
+  const leonLLM = getOptionalLLMTarget(llmConfig.default)
+  const leonWorkflowLLM = getOptionalLLMTarget(llmConfig.workflow)
+  const leonAgentLLM = getOptionalLLMTarget(llmConfig.agent)
   const hasExplicitModeOverride =
     leonWorkflowLLM !== '' || leonAgentLLM !== ''
   const hasExplicitGlobalTarget =
-    leonLLM !== '' && leonLLM !== DISABLED_LLM_TARGET_VALUE
+    leonLLM !== ''
 
   if (
     preferences.remoteLLMProvider &&
@@ -118,8 +170,8 @@ async function syncLLMSetupChoice(preferences) {
     )
 
     if (!hasExplicitModeOverride) {
-      await updateDotEnvVariable(
-        'LEON_LLM',
+      await CONFIG_MANAGER.setValue(
+        ['llm', 'default'],
         `${preferences.remoteLLMProvider}/${preferences.remoteLLMModel}`
       )
     }
@@ -132,14 +184,12 @@ async function syncLLMSetupChoice(preferences) {
   }
 
   if (preferences.setupLocalAI) {
-    if (leonLLM === DISABLED_LLM_TARGET_VALUE) {
-      await updateDotEnvVariable('LEON_LLM', '')
-    }
+    await CONFIG_MANAGER.setValue(['llm', 'default'], LOCAL_LLM_TARGET_VALUE)
 
     return
   }
 
-  await updateDotEnvVariable('LEON_LLM', DISABLED_LLM_TARGET_VALUE)
+  await CONFIG_MANAGER.setValue(['llm', 'default'], null)
 }
 // Do not load ".env" file because it is not created yet
 
@@ -155,8 +205,12 @@ async function syncLLMSetupChoice(preferences) {
     setupVoice: false
   }
   let localAICapability = null
+  let localAISetupState = {
+    isInstalled: false,
+    label: ''
+  }
   let voiceSetupState = {
-    isReady: false
+    isInstalled: false
   }
   const getExitCodeFromSignal = (signal) => (signal === 'SIGINT' ? 130 : 143)
 
@@ -213,6 +267,8 @@ async function syncLLMSetupChoice(preferences) {
 
       currentStep = 'resolveExistingLLMChoice'
       const existingLLMChoice = await resolveExistingLLMChoice()
+      currentStep = 'inspectLocalAISetupState'
+      localAISetupState = inspectLocalAISetupState()
       currentStep = 'inspectVoiceSetupState'
       voiceSetupState = inspectVoiceSetupState()
 
@@ -220,6 +276,7 @@ async function syncLLMSetupChoice(preferences) {
       preferences = await setupPreferences(
         localAICapability,
         existingLLMChoice,
+        localAISetupState,
         voiceSetupState
       )
     }
@@ -227,8 +284,14 @@ async function syncLLMSetupChoice(preferences) {
     // Prepare the local runtime, bridges, skills, and shared memory models.
     SetupUI.section('Base Setup')
 
+    currentStep = 'ensureLeonHomeStructure'
+    await ensureLeonHomeStructure()
     currentStep = 'setupDotenv'
     await setupDotenv()
+    currentStep = 'generateJSONSchemas'
+    await generateJSONSchemas()
+    currentStep = 'setupConfig'
+    await setupConfig()
     currentStep = 'syncLLMSetupChoice'
     await syncLLMSetupChoice(preferences)
     currentStep = 'setupCore'
@@ -255,6 +318,10 @@ async function syncLLMSetupChoice(preferences) {
     await setupPythonBridgeEnv()
     currentStep = 'setupTCPServerEnv'
     await setupTCPServerEnv()
+    currentStep = 'setupToolsDependencies'
+    await setupToolsDependencies()
+    currentStep = 'setupToolsSettings'
+    await setupToolsSettings()
     currentStep = 'setupSkills'
     await setupSkills()
     if (!IS_GITHUB_ACTIONS) {
@@ -311,8 +378,6 @@ async function syncLLMSetupChoice(preferences) {
 
     currentStep = 'generateHTTPAPIKey'
     await generateHTTPAPIKey()
-    currentStep = 'generateJSONSchemas'
-    await generateJSONSchemas()
     currentStep = 'train'
     await train()
     currentStep = 'setFfprobePermissions'

@@ -25,11 +25,11 @@ import { createSetupStatus } from './setup-status'
 const DEFAULT_LLM_OPTIONS = [
   {
     minimumTotalVRAM: LLM_HIGH_TIER_MINIMUM_TOTAL_VRAM,
-    name: 'Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive',
+    name: 'Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive',
     version: 'Q4_K_M',
-    fileName: 'Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf',
+    fileName: 'Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf',
     downloadURL:
-      'https://huggingface.co/HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf?download=true'
+      'https://huggingface.co/HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf?download=true'
   },
   {
     minimumTotalVRAM: LLM_MINIMUM_TOTAL_VRAM,
@@ -54,8 +54,8 @@ function readManifest() {
   }
 }
 
-function toRelativeModelPath(modelPath) {
-  return path.relative(process.cwd(), modelPath).split(path.sep).join('/')
+function normalizeModelPath(modelPath) {
+  return path.resolve(modelPath)
 }
 
 async function removePreviousDefaultModel(previousModelPath, nextModelPath) {
@@ -63,9 +63,10 @@ async function removePreviousDefaultModel(previousModelPath, nextModelPath) {
     return
   }
 
-  const resolvedPreviousModelPath = path.resolve(process.cwd(), previousModelPath)
+  const resolvedPreviousModelPath = normalizeModelPath(previousModelPath)
 
-  // Only delete the previous default model we installed under core/data/models/llm/.
+  // Only delete the previous default model we installed under Leon's managed
+  // shared models directory.
   if (!resolvedPreviousModelPath.startsWith(`${LLM_DIR_PATH}${path.sep}`)) {
     return
   }
@@ -84,7 +85,7 @@ function getSelectedModel(totalVRAM) {
 async function downloadLLM(selectedModel) {
   const manifest = readManifest()
   const targetPath = path.join(LLM_DIR_PATH, selectedModel.fileName)
-  const defaultInstalledLLMPath = toRelativeModelPath(targetPath)
+  const defaultInstalledLLMPath = normalizeModelPath(targetPath)
   const isCurrentModelInstalled =
     manifest?.name === selectedModel.name &&
     manifest?.version === selectedModel.version &&

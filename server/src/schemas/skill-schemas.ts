@@ -1,6 +1,7 @@
 import type { Static } from '@sinclair/typebox'
 import { Type } from '@sinclair/typebox'
 
+import { REMIX_ICON_NAME_PATTERN } from '@/constants'
 import { SkillBridges } from '@/core/brain/types'
 import { NLPAction } from '@/core/nlp/types'
 
@@ -216,6 +217,12 @@ export const skillLocaleConfigObject = Type.Strict(
 export const skillSchemaObject = Type.Strict(
   Type.Object({
     name: Type.String({ minLength: 1, description: 'The name of the skill.' }),
+    icon_name: Type.String({
+      minLength: 1,
+      pattern: REMIX_ICON_NAME_PATTERN,
+      description:
+        'Icon name from https://remixicon.com. Filled icons ending with "-fill" are not allowed.'
+    }),
     bridge: Type.Union(skillBridges, { description: 'Bridge SDK.' }),
     version: Type.String({
       minLength: 1,
@@ -251,10 +258,10 @@ export const skillSchemaObject = Type.Strict(
           'A person who has been involved in creating or maintaining this skill.'
       }
     ),
-    flow: Type.Optional(
+    workflow: Type.Optional(
       Type.Array(Type.String(), {
         description:
-          'The flow is a sequence of actions that will be executed in order. Only the first action in the flow will be added to the action calling to avoid overloading the context with too many actions.'
+          'The workflow is a sequence of actions that will be executed in order. Only the first action in the workflow will be added to the action calling to avoid overloading the context with too many actions.'
       })
     ),
     actions: Type.Record(

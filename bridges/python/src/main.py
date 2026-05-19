@@ -2,9 +2,9 @@ import sys
 import os
 import inspect
 from traceback import print_exc
-from importlib import import_module
+from importlib import util
 
-from constants import INTENT_OBJECT
+from constants import INTENT_OBJECT, SKILL_PATH
 from sdk.params_helper import ParamsHelper
 
 
@@ -26,22 +26,34 @@ def resolve_action_function(skill_action_module):
     return None
 
 
-def main():
-    skill_src_path = os.path.join(
-        'skills', INTENT_OBJECT['skill_name'], 'src'
-    )
-    skill_vendor_path = os.path.abspath(
+def get_skill_venv_site_packages_path():
+    venv_path = os.path.join(SKILL_PATH, 'src', '.venv')
+    candidates = [
         os.path.join(
-            'skills',
-            INTENT_OBJECT['skill_name'],
-            '.runtime',
-            'vendor'
+            venv_path,
+            'Lib',
+            'site-packages'
+        ),
+        os.path.join(
+            venv_path,
+            'lib',
+            f'python{sys.version_info.major}.{sys.version_info.minor}',
+            'site-packages'
         )
-    )
+    ]
 
-    if os.path.isdir(skill_vendor_path):
-        # Skill-specific Python dependencies are vendored at install time.
-        sys.path.insert(0, skill_vendor_path)
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+
+    return None
+
+
+def main():
+    skill_site_packages_path = get_skill_venv_site_packages_path()
+
+    if skill_site_packages_path:
+        sys.path.insert(0, skill_site_packages_path)
 
     params = {
         'lang': INTENT_OBJECT['lang'],
@@ -60,13 +72,25 @@ def main():
 
     try:
         sys.path.append('.')
+        sys.path.insert(0, os.path.dirname(SKILL_PATH))
 
-        skill_action_module = import_module(
-            'skills.'
-            + INTENT_OBJECT['skill_name']
-            + '.src.actions.'
-            + INTENT_OBJECT['action_name']
+        action_path = os.path.join(
+            SKILL_PATH,
+            'src',
+            'actions',
+            INTENT_OBJECT['action_name'] + '.py'
         )
+        spec = util.spec_from_file_location(
+            INTENT_OBJECT['skill_name']
+            + '.src.actions.'
+            + INTENT_OBJECT['action_name'],
+            action_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f'Cannot load action module from "{action_path}"')
+
+        skill_action_module = util.module_from_spec(spec)
+        spec.loader.exec_module(skill_action_module)
 
         run_function = resolve_action_function(skill_action_module)
         if not callable(run_function):
@@ -94,8 +118,7 @@ def main():
 
 if __name__ == '__main__':
     try:
-        raise main()
-    except Exception as e:
-        # Print full traceback error report if skills triggers an error from the call stack
-        if 'exceptions must derive from BaseException' not in str(e):
-            print_exc()
+        main()
+    except Exception:
+        # Print full traceback error report if skills triggers an error from the call stack.
+        print_exc()

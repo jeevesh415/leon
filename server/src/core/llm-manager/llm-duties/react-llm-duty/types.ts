@@ -6,7 +6,19 @@ import type {
   OpenAIToolChoice
 } from '@/core/llm-manager/types'
 
-export type ReactLLMDutyParams = LLMDutyParams
+export interface AgentSkillContext {
+  id: string
+  name: string
+  description: string
+  rootPath: string
+  skillPath: string
+  instructions: string
+}
+
+export interface ReactLLMDutyParams extends LLMDutyParams {
+  agentSkill?: AgentSkillContext | null
+  forcedToolName?: string | null
+}
 
 export interface FunctionConfig {
   description: string
@@ -24,6 +36,7 @@ export type ToolFunctionsMap = Record<string, FunctionConfig>
 export interface PlanStep {
   function: string
   label: string
+  agentSkillId?: string
 }
 
 export interface ExecutionRecord {
@@ -34,7 +47,7 @@ export interface ExecutionRecord {
   requestedToolInput?: string
 }
 
-export type PlanStepStatus = 'pending' | 'in_progress' | 'completed'
+export type PlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'error'
 
 export interface TrackedPlanStep {
   label: string
@@ -99,6 +112,7 @@ export interface LLMCallOptions {
   emitReasoning?: boolean
   streamToProvider?: boolean
   streamToUser?: boolean
+  maxTokens?: number
 }
 
 /**
@@ -153,10 +167,16 @@ export interface LLMCaller {
   } | null>
 
   readonly supportsNativeTools: boolean
+  readonly isLocalProvider: boolean
   readonly input: string | object | null
   readonly history: MessageLog[]
+  readonly agentSkillContext?: AgentSkillContext | null
+  readonly agentSkillCatalog: string
+  setAgentSkillContext(context: AgentSkillContext): void
+  getAgentSkillContext(skillId: string): Promise<AgentSkillContext | null>
   getContextFileContent(filename: string): string | null
   getContextManifest(): string
   getSelfModelSnapshot(): string
+  getPreviousToolArtifacts?(): Promise<string>
   consumeProviderErrorMessage(): string | null
 }

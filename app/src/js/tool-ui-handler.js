@@ -1,3 +1,8 @@
+const COMMAND_OUTPUT_MAX_DISPLAY_CHARS = 80_000
+const ANSI_ESCAPE_PATTERN =
+  // eslint-disable-next-line no-control-regex
+  /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g
+
 /**
  * Tool UI Handler
  * Renders tool executions as expandable activity cards.
@@ -14,6 +19,10 @@ export default class ToolUIHandler {
    * Handle tool output messages with interactive activity cards.
    */
   handleToolOutput(data) {
+    if (data.activityType === 'agent_skill') {
+      return this.handleAgentSkillActivity(data)
+    }
+
     const {
       toolkitName,
       toolName,
@@ -61,10 +70,54 @@ export default class ToolUIHandler {
     }
   }
 
+  handleAgentSkillActivity(data) {
+    const agentSkill = data.agentSkill || {}
+    const skillId = agentSkill.id || agentSkill.name || 'agent-skill'
+    const groupId = data.toolGroupId || `agent_skill_${skillId}_${Date.now()}`
+
+    let activityContainer = this.toolGroups.get(groupId)
+
+    if (!activityContainer) {
+      activityContainer = this.createAgentSkillActivityCard({
+        groupId,
+        agentSkill
+      })
+      this.toolGroups.set(groupId, activityContainer)
+    }
+
+    this.updateAgentSkillActivityCard(activityContainer, data)
+    this.scrollDown()
+
+    return {
+      groupId,
+      isNewGroup: activityContainer.isNew
+    }
+  }
+
   createToolGroupContainer(params) {
     return params.mode === 'activity_card'
       ? this.createActivityCardContainer(params)
       : this.createLegacyToolGroupContainer(params)
+  }
+
+  getRemixIconClass(iconName) {
+    const fallbackIconName = 'ri-magic-line'
+    if (typeof iconName !== 'string') {
+      return fallbackIconName
+    }
+
+    const trimmedIconName = iconName.trim()
+    if (!trimmedIconName || trimmedIconName.includes(' ')) {
+      return fallbackIconName
+    }
+
+    return trimmedIconName.startsWith('ri-')
+      ? trimmedIconName
+      : `ri-${trimmedIconName}`
+  }
+
+  getToolActivityIconClass(data) {
+    return this.getRemixIconClass(data.toolIconName || data.toolkitIconName)
   }
 
   /**
@@ -131,7 +184,7 @@ export default class ToolUIHandler {
     heading.className = 'tool-activity-heading'
 
     const icon = document.createElement('i')
-    icon.className = 'ri-magic-line tool-icon'
+    icon.className = `${this.getToolActivityIconClass(data)} tool-icon`
 
     const titleBlock = document.createElement('div')
     titleBlock.className = 'tool-activity-title-block'
@@ -222,6 +275,94 @@ export default class ToolUIHandler {
       rawDetails,
       rawInput: null,
       rawOutput: null,
+      commandOutputText: '',
+      preparationLog: [],
+      isNew: true
+    }
+  }
+
+  createAgentSkillActivityCard({ groupId, agentSkill }) {
+    const groupContainer = document.createElement('div')
+    groupContainer.className =
+      'tool-group-container tool-activity-card agent-skill-activity-card'
+    groupContainer.setAttribute('data-tool-group-id', groupId)
+
+    const skillName = agentSkill.name || agentSkill.id || 'Agent Skill'
+    const skillPath = agentSkill.skillPath || 'SKILL.md'
+
+    const toolHeader = document.createElement('button')
+    toolHeader.className = 'tool-header tool-activity-header'
+    toolHeader.setAttribute('type', 'button')
+
+    const heading = document.createElement('div')
+    heading.className = 'tool-activity-heading'
+
+    const icon = document.createElement('i')
+    icon.className = 'ri-book-ai-line tool-icon'
+
+    const titleBlock = document.createElement('div')
+    titleBlock.className = 'tool-activity-title-block'
+
+    const title = document.createElement('span')
+    title.className = 'tool-title'
+    title.textContent = `Agent Skill: ${skillName}`
+
+    const subtitle = document.createElement('span')
+    subtitle.className = 'tool-subtitle'
+    subtitle.textContent = skillPath
+    subtitle.setAttribute('title', skillPath)
+
+    titleBlock.appendChild(title)
+    titleBlock.appendChild(subtitle)
+    heading.appendChild(icon)
+    heading.appendChild(titleBlock)
+
+    const meta = document.createElement('div')
+    meta.className = 'tool-activity-meta'
+
+    const statusChip = document.createElement('span')
+    statusChip.className = 'tool-status-chip selected'
+    statusChip.textContent = 'In use'
+
+    const expandIcon = document.createElement('i')
+    expandIcon.className = 'ri-arrow-down-s-line expand-icon'
+
+    meta.appendChild(statusChip)
+    meta.appendChild(expandIcon)
+    toolHeader.appendChild(heading)
+    toolHeader.appendChild(meta)
+
+    const toolContent = document.createElement('div')
+    toolContent.className = 'tool-content'
+
+    const summary = document.createElement('div')
+    summary.className = 'tool-activity-summary'
+    summary.textContent = 'Following SKILL.md instructions for this step.'
+
+    const sections = document.createElement('div')
+    sections.className = 'tool-activity-sections single'
+
+    const skillPanel = this.createActivityPanel(
+      'Skill',
+      'Agent Skill context for this step'
+    )
+    sections.appendChild(skillPanel.panel)
+
+    toolContent.appendChild(summary)
+    toolContent.appendChild(sections)
+    groupContainer.appendChild(toolHeader)
+    groupContainer.appendChild(toolContent)
+
+    this.addExpandCollapseHandler(toolHeader, toolContent)
+    this.feed.appendChild(groupContainer)
+
+    return {
+      mode: 'agent_skill',
+      container: groupContainer,
+      title,
+      subtitle,
+      statusChip,
+      skillBody: skillPanel.body,
       isNew: true
     }
   }
@@ -314,14 +455,56 @@ export default class ToolUIHandler {
       }
     }
 
+    if (data.toolPhase === 'preparation') {
+      const progressMessage = data.message || data.answer || ''
+      this.setStatusChip(toolGroupContainer.statusChip, 'running')
+
+      if (progressMessage) {
+        toolGroupContainer.summary.textContent = progressMessage
+        toolGroupContainer.preparationLog.push(progressMessage)
+        this.renderPreparationLog(
+          toolGroupContainer.outputBody,
+          toolGroupContainer.preparationLog
+        )
+        toolGroupContainer.rawOutput = {
+          preparation: toolGroupContainer.preparationLog
+        }
+      }
+    }
+
+    if (data.toolPhase === 'output_delta') {
+      const outputDelta = data.outputDelta || data.answer || ''
+      this.setStatusChip(toolGroupContainer.statusChip, 'running')
+
+      if (outputDelta) {
+        toolGroupContainer.summary.textContent = 'Receiving command output...'
+        toolGroupContainer.commandOutputText = this.mergeCommandOutput(
+          toolGroupContainer.commandOutputText,
+          outputDelta
+        )
+        this.renderCommandOutputLog(
+          toolGroupContainer.outputBody,
+          toolGroupContainer.commandOutputText
+        )
+        toolGroupContainer.rawOutput = {
+          output: toolGroupContainer.commandOutputText
+        }
+      }
+    }
+
     if (data.toolPhase === 'output') {
       const isError = data.status === 'error'
+      const isObserved = data.status === 'observed'
       toolGroupContainer.summary.textContent =
         data.message ||
-        (isError ? 'The function failed.' : 'The function completed.')
+        (isError
+          ? 'The function failed.'
+          : isObserved
+            ? 'The function returned an observation.'
+            : 'The function completed.')
       this.setStatusChip(
         toolGroupContainer.statusChip,
-        isError ? 'error' : 'success'
+        isError ? 'error' : isObserved ? 'observed' : 'success'
       )
 
       const outputPayload = {
@@ -336,6 +519,34 @@ export default class ToolUIHandler {
 
     if (toolGroupContainer.isNew) {
       toolGroupContainer.isNew = false
+    }
+  }
+
+  updateAgentSkillActivityCard(activityContainer, data) {
+    const agentSkill = data.agentSkill || {}
+    const skillName = agentSkill.name || agentSkill.id || 'Agent Skill'
+    const skillPath = agentSkill.skillPath || ''
+
+    activityContainer.title.textContent = `Agent Skill: ${skillName}`
+    activityContainer.subtitle.textContent = skillPath || 'SKILL.md'
+    activityContainer.subtitle.setAttribute(
+      'title',
+      skillPath || 'SKILL.md'
+    )
+    this.setStatusChip(activityContainer.statusChip, 'selected')
+    this.renderValuePreview(
+      activityContainer.skillBody,
+      {
+        name: skillName,
+        description: agentSkill.description || '',
+        root_path: agentSkill.rootPath || '',
+        skill_path: skillPath
+      },
+      'No Agent Skill metadata'
+    )
+
+    if (activityContainer.isNew) {
+      activityContainer.isNew = false
     }
   }
 
@@ -384,6 +595,107 @@ export default class ToolUIHandler {
 
     const preview = this.buildValueNode(data.output)
     container.appendChild(preview)
+  }
+
+  /**
+   * Render preparation progress before the final tool output is available.
+   */
+  renderPreparationLog(container, messages) {
+    container.innerHTML = ''
+
+    if (!messages.length) {
+      this.renderPlaceholder(container, 'Waiting for function output...')
+      return
+    }
+
+    const list = document.createElement('ul')
+    list.className = 'tool-value-list'
+
+    messages.forEach((message) => {
+      const item = document.createElement('li')
+      item.textContent = message
+      list.appendChild(item)
+    })
+
+    container.appendChild(list)
+  }
+
+  /**
+   * Merge terminal output chunks while respecting carriage-return progress
+   * updates used by CLI tools to repaint the current line.
+   */
+  mergeCommandOutput(currentOutput, nextChunk) {
+    const cleanChunk = this.cleanCommandOutputChunk(nextChunk)
+    if (!cleanChunk) {
+      return currentOutput || ''
+    }
+
+    let output = currentOutput || ''
+    let replaceCurrentLine = false
+
+    for (const char of cleanChunk) {
+      if (char === '\r') {
+        replaceCurrentLine = true
+        continue
+      }
+
+      if (char === '\n') {
+        output += '\n'
+        replaceCurrentLine = false
+        continue
+      }
+
+      if (replaceCurrentLine) {
+        const lineStartIndex = output.lastIndexOf('\n') + 1
+        output = output.slice(0, lineStartIndex)
+        replaceCurrentLine = false
+      }
+
+      output += char
+    }
+
+    if (output.length <= COMMAND_OUTPUT_MAX_DISPLAY_CHARS) {
+      return output
+    }
+
+    return output.slice(output.length - COMMAND_OUTPUT_MAX_DISPLAY_CHARS)
+  }
+
+  /**
+   * Strip terminal control sequences that do not render usefully in HTML.
+   */
+  cleanCommandOutputChunk(chunk) {
+    const withoutAnsi = String(chunk || '').replace(ANSI_ESCAPE_PATTERN, '')
+    const output = []
+
+    for (const char of withoutAnsi) {
+      if (char === '\b') {
+        output.pop()
+        continue
+      }
+
+      output.push(char)
+    }
+
+    return output.join('')
+  }
+
+  /**
+   * Render live command output in the result panel.
+   */
+  renderCommandOutputLog(container, outputText) {
+    container.innerHTML = ''
+
+    if (!outputText) {
+      this.renderPlaceholder(container, 'Waiting for function output...')
+      return
+    }
+
+    const output = document.createElement('pre')
+    output.className = 'tool-command-output'
+    output.textContent = outputText
+    container.appendChild(output)
+    output.scrollTop = output.scrollHeight
   }
 
   /**
@@ -557,7 +869,7 @@ export default class ToolUIHandler {
    * Update the status chip for the activity card.
    */
   setStatusChip(chip, status) {
-    chip.classList.remove('running', 'success', 'error')
+    chip.classList.remove('running', 'success', 'error', 'selected', 'observed')
 
     if (status === 'error') {
       chip.classList.add('error')
@@ -568,6 +880,18 @@ export default class ToolUIHandler {
     if (status === 'success') {
       chip.classList.add('success')
       chip.textContent = 'Done'
+      return
+    }
+
+    if (status === 'selected') {
+      chip.classList.add('selected')
+      chip.textContent = 'In use'
+      return
+    }
+
+    if (status === 'observed') {
+      chip.classList.add('observed')
+      chip.textContent = 'Observed'
       return
     }
 

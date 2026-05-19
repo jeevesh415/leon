@@ -20,7 +20,14 @@ import {
   PYTORCH_TORCH_PATH,
   PYTHON_TCP_SERVER_ENTRY_PATH,
   PYTHON_TCP_SERVER_RUNTIME_BIN_PATH,
-  SHOULD_START_PYTHON_TCP_SERVER
+  SHOULD_START_PYTHON_TCP_SERVER,
+  HAS_STT,
+  HAS_TTS,
+  HAS_WAKE_WORD,
+  STT_PROVIDER,
+  TTS_PROVIDER,
+  PYTHON_TCP_SERVER_HOST,
+  PYTHON_TCP_SERVER_PORT
 } from '@/constants'
 import {
   PYTHON_TCP_CLIENT,
@@ -35,17 +42,13 @@ import {
 import { shouldIgnoreTCPServerError } from '@/utilities'
 import { Updater } from '@/updater'
 import { Telemetry } from '@/telemetry'
-// import { CustomNERLLMDuty } from '@/core/llm-manager/llm-duties/custom-ner-llm-duty'
-// import { SummarizationLLMDuty } from '@/core/llm-manager/llm-duties/summarization-llm-duty'
-// import { TranslationLLMDuty } from '@/core/llm-manager/llm-duties/translation-llm-duty'
-// import { ParaphraseLLMDuty } from '@/core/llm-manager/llm-duties/paraphrase-llm-duty'
-// import { ActionRecognitionLLMDuty } from '@/core/llm-manager/llm-duties/action-recognition-llm-duty'
 import { LangHelper } from '@/helpers/lang-helper'
 import { LogHelper } from '@/helpers/log-helper'
 import { RuntimeHelper } from '@/helpers/runtime-helper'
 import { SystemHelper } from '@/helpers/system-helper'
 import { CONFIG_STATE } from '@/core/config-states/config-state'
-;(async (): Promise<void> => {
+
+async function bootstrap(): Promise<void> {
   process.title = 'leon'
   const shouldStartPythonTCPServer = SHOULD_START_PYTHON_TCP_SERVER
 
@@ -90,6 +93,13 @@ import { CONFIG_STATE } from '@/core/config-states/config-state'
     LogHelper.info(`Running command: ${tcpServerCmd}`)
 
     const tcpServerEnv = { ...process.env }
+    tcpServerEnv['LEON_STT'] = HAS_STT ? 'true' : 'false'
+    tcpServerEnv['LEON_STT_PROVIDER'] = STT_PROVIDER || ''
+    tcpServerEnv['LEON_TTS'] = HAS_TTS ? 'true' : 'false'
+    tcpServerEnv['LEON_TTS_PROVIDER'] = TTS_PROVIDER || ''
+    tcpServerEnv['LEON_WAKE_WORD'] = HAS_WAKE_WORD ? 'true' : 'false'
+    tcpServerEnv['LEON_PY_TCP_SERVER_HOST'] = PYTHON_TCP_SERVER_HOST
+    tcpServerEnv['LEON_PY_TCP_SERVER_PORT'] = String(PYTHON_TCP_SERVER_PORT)
 
     if (SystemHelper.isLinux()) {
       const torchLibPath = `${PYTORCH_TORCH_PATH}/lib`
@@ -113,8 +123,9 @@ import { CONFIG_STATE } from '@/core/config-states/config-state'
       PYTHON_TCP_SERVER_RUNTIME_BIN_PATH,
       tcpServerCommandArgs,
       {
-      detached: IS_DEVELOPMENT_ENV,
-      env: tcpServerEnv
+        detached: IS_DEVELOPMENT_ENV,
+        env: tcpServerEnv,
+        windowsHide: true
       }
     )
     global.pythonTCPServerProcess.stdout.on('data', (data: Buffer) => {
@@ -264,4 +275,6 @@ import { CONFIG_STATE } from '@/core/config-states/config-state'
     LogHelper.error(`Unhandled rejection: ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`)
     shutdown(1)
   })
-})()
+}
+
+void bootstrap()

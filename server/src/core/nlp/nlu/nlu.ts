@@ -27,7 +27,8 @@ import {
   LLM_PROVIDER,
   TOOL_CALL_LOGGER,
   SELF_MODEL_MANAGER,
-  PULSE_MANAGER
+  PULSE_MANAGER,
+  POST_TURN_MAINTENANCE_QUEUE
 } from '@/core'
 import { LogHelper } from '@/helpers/log-helper'
 import Conversation from '@/core/nlp/conversation'
@@ -42,9 +43,11 @@ import { ActionCallingLLMDuty } from '@/core/llm-manager/llm-duties/action-calli
 import { SlotFillingLLMDuty } from '@/core/llm-manager/llm-duties/slot-filling-llm-duty'
 import { ReActLLMDuty } from '@/core/llm-manager/llm-duties/react-llm-duty'
 import { LEON_ROUTING_MODE } from '@/constants'
-import { RoutingMode } from '@/types'
+import { RoutingMode, SkillFormat } from '@/types'
 import { CONFIG_STATE } from '@/core/config-states/config-state'
 import { WorkflowProgressWidget } from '@/core/nlp/nlu/workflow-progress-widget'
+import { CONVERSATION_SESSION_MANAGER } from '@/core/session-manager'
+import { getActiveConversationSessionId } from '@/core/session-manager/session-context'
 
 // TODO: delete?
 export const DEFAULT_NLU_RESULT = {
@@ -65,7 +68,7 @@ export const DEFAULT_NLU_RESULT = {
   actionConfig: null
 }
 
-type RoutingRoute = 'workflow' | 'react'
+type RoutingRoute = 'controlled' | 'react'
 
 const NO_LLM_ENABLED_MESSAGE =
   'I need an AI engine before I can answer. Enable local AI or configure an online provider. Use the built-in command "/model <provider> <model name>" to configure a model. Just press "/" to open built-in commands.'
@@ -77,17 +80,32 @@ export default class NLU {
   private _nluProcessResult = DEFAULT_NLU_PROCESS_RESULT
   private _nluResult: NLUResult = DEFAULT_NLU_RESULT
   // Used to store the conversation state (across multiple turns)
-  public conversation = new Conversation('conv0')
+  private readonly conversations = new Map<string, Conversation>()
   private hasHandledProviderFailure = false
-  private _currentResponseRoute: RoutingRoute = 'workflow'
+  private _currentResponseRoute: RoutingRoute = 'controlled'
   private workflowProgress = new WorkflowProgressWidget()
   private pendingWorkflowNotFoundChoice: {
     originalUtterance: NLPUtterance
   } | null = null
 
   private readonly routingRoutes: Record<RoutingRoute, RoutingRoute> = {
-    workflow: 'workflow',
+    controlled: 'controlled',
     react: 'react'
+  }
+
+  public get conversation(): Conversation {
+    const sessionId = getActiveConversationSessionId() || 'conv0'
+    const existingConversation = this.conversations.get(sessionId)
+
+    if (existingConversation) {
+      return existingConversation
+    }
+
+    const conversation = new Conversation(sessionId)
+
+    this.conversations.set(sessionId, conversation)
+
+    return conversation
   }
 
   get nluProcessResult(): NLUProcessResult {
@@ -202,6 +220,23 @@ export default class NLU {
     LogHelper.info('Choosing skill...')
 
     try {
+      // Force skill selection when only one is available
+      const nativeSkillDescriptors = SkillDomainHelper.listSkillDescriptorsSync()
+        .filter((descriptor) => descriptor.format === SkillFormat.LeonNative)
+
+      if (nativeSkillDescriptors.length === 1) {
+        const [skillDescriptor] = nativeSkillDescriptors
+
+        if (skillDescriptor) {
+          LogHelper.title('NLU')
+          LogHelper.info(
+            `Only one native skill is enabled; selecting "${skillDescriptor.id}".`
+          )
+
+          return skillDescriptor.id as NLPSkill
+        }
+      }
+
       const skillRouterHistory = await CONVERSATION_LOGGER.load({
         nbOfLogsToLoad: 6
       })
@@ -218,9 +253,22 @@ export default class NLU {
         return null
       }
 
-      const skillResult = skillRouterResult?.output as unknown as string
+      const skillResult = String(skillRouterResult?.output || '').trim()
 
       if (skillResult && skillResult !== 'None') {
+        const skillDescriptor = SkillDomainHelper.getSkillDescriptorSync(
+          skillResult
+        )
+
+        if (!skillDescriptor) {
+          LogHelper.title('NLU')
+          LogHelper.warning(
+            `Skill router selected unavailable skill "${skillResult}"; ignoring it.`
+          )
+
+          return null
+        }
+
         return skillResult as NLPSkill
       }
 
@@ -397,22 +445,25 @@ export default class NLU {
     }
   }
 
-  private async handleSkillFlow(flow: SkillSchema['flow']): Promise<boolean> {
-    if (flow) {
+  private async handleSkillWorkflow(
+    workflow: SkillSchema['workflow']
+  ): Promise<boolean> {
+    if (workflow) {
       LogHelper.title('NLU')
-      LogHelper.info('Handling skill flow...')
+      LogHelper.info('Handling skill workflow...')
 
       try {
         const currentAction = this._nluProcessResult.actionName
-        const currentActionIndex = flow.indexOf(currentAction)
-        const isLastActionInFlow = currentActionIndex === flow.length - 1
+        const currentActionIndex = workflow.indexOf(currentAction)
+        const isLastActionInWorkflow =
+          currentActionIndex === workflow.length - 1
 
         /**
-         * If the current action is not the last one in the flow,
+         * If the current action is not the last one in the workflow,
          * prepare the next action
          */
-        if (!isLastActionInFlow) {
-          const nextActionName = flow[currentActionIndex + 1] as string
+        if (!isLastActionInWorkflow) {
+          const nextActionName = workflow[currentActionIndex + 1] as string
 
           if (nextActionName.includes(':')) {
             // This is a cross-skill action call
@@ -421,24 +472,24 @@ export default class NLU {
 
             await this.jumpToNextAction(nextActionName)
 
-            // After cross-skill action completes, return to original skill and continue flow
+            // After cross-skill action completes, return to original skill and continue workflow
             if (crossSkillName !== originalSkillName) {
-              // Continue with the remaining actions in the flow (after the cross-skill call)
-              const remainingFlow = flow.slice(currentActionIndex + 2)
-              const isRemainingFlowNotDone = remainingFlow.length > 0
+              // Continue with the remaining actions in the workflow (after the cross-skill call)
+              const remainingWorkflow = workflow.slice(currentActionIndex + 2)
+              const isRemainingWorkflowNotDone = remainingWorkflow.length > 0
 
-              if (isRemainingFlowNotDone) {
-                const nextOriginalAction = remainingFlow[0] as string
+              if (isRemainingWorkflowNotDone) {
+                const nextOriginalAction = remainingWorkflow[0] as string
 
                 await NLUProcessResultUpdater.update({
                   skillName: originalSkillName,
                   actionName: nextOriginalAction
                 })
 
-                return await this.handleSkillFlow(remainingFlow)
+                return await this.handleSkillWorkflow(remainingWorkflow)
               }
 
-              // No more actions in flow, clean up
+              // No more actions in workflow, clean up
               this.conversation.cleanActiveState()
               await NLUProcessResultUpdater.update(DEFAULT_NLU_PROCESS_RESULT)
 
@@ -462,7 +513,7 @@ export default class NLU {
           })
 
           /**
-           * If the next action in the flow has no parameters, execute it immediately
+           * If the next action in the workflow has no parameters, execute it immediately
            * without waiting for another user input. E.g., the "set_up" action
            */
           if (this.getRequiredParamsForAction(nextActionConfig).length === 0) {
@@ -473,7 +524,7 @@ export default class NLU {
             })
           } else {
             // The current action is finished. Clear the workflow widget before
-            // waiting for the owner's input for the next action in the flow.
+            // waiting for the owner's input for the next action in the workflow.
             this.workflowProgress.completeAll()
             this.workflowProgress.reset()
             await this.sendSuggestions()
@@ -485,7 +536,7 @@ export default class NLU {
         return false
       } catch (e) {
         LogHelper.title('NLU')
-        LogHelper.error(`Failed to handle skill flow: ${e}`)
+        LogHelper.error(`Failed to handle skill workflow: ${e}`)
       }
     }
 
@@ -500,7 +551,7 @@ export default class NLU {
     await NLUProcessResultUpdater.update(DEFAULT_NLU_PROCESS_RESULT)
 
     const leonMode = this.getLeonMode()
-    if (leonMode === RoutingMode.Workflow) {
+    if (leonMode === RoutingMode.Controlled) {
       this.workflowProgress.completeSelectionNotFound()
       this.workflowProgress.reset()
       const utterance = this._nluProcessResult.new.utterance as NLPUtterance
@@ -616,10 +667,22 @@ export default class NLU {
   }
 
   private getLeonMode(): RoutingMode {
+    return this.resolveLeonMode()
+  }
+
+  private resolveLeonMode(forcedMode?: RoutingMode): RoutingMode {
+    if (
+      forcedMode === RoutingMode.Controlled ||
+      forcedMode === RoutingMode.Agent ||
+      forcedMode === RoutingMode.Smart
+    ) {
+      return forcedMode
+    }
+
     const runtimeRoutingMode = CONFIG_STATE.getRoutingModeState().getRoutingMode()
     const mode = String(runtimeRoutingMode || RoutingMode.Smart).toLowerCase()
     if (
-      mode === RoutingMode.Workflow ||
+      mode === RoutingMode.Controlled ||
       mode === RoutingMode.Agent ||
       mode === RoutingMode.Smart
     ) {
@@ -634,35 +697,100 @@ export default class NLU {
     return RoutingMode.Smart
   }
 
-  private getRoutingDecision(): {
+  private getWorkflowUtterance(
+    utterance: NLPUtterance,
+    forcedSkillName?: NLPSkill
+  ): NLPUtterance {
+    if (!forcedSkillName) {
+      return utterance
+    }
+
+    const trimmedUtterance = utterance.trim()
+    const utteranceTokens = trimmedUtterance.split(/\s+/).filter(Boolean)
+    const normalizedCommand = utteranceTokens[0]?.toLowerCase() || ''
+    const normalizedSkillName = SkillDomainHelper.getSkillCommandName(
+      forcedSkillName
+    ).toLowerCase()
+
+    if (
+      utteranceTokens.length < 2 ||
+      (normalizedCommand !== '/skill' && normalizedCommand !== '/s') ||
+      utteranceTokens[1]?.toLowerCase() !== normalizedSkillName
+    ) {
+      return utterance
+    }
+
+    return utteranceTokens.slice(2).join(' ').trim()
+  }
+
+  private getToolUtterance(
+    utterance: NLPUtterance,
+    forcedToolName?: string
+  ): NLPUtterance {
+    if (!forcedToolName) {
+      return utterance
+    }
+
+    const trimmedUtterance = utterance.trim()
+    const utteranceTokens = trimmedUtterance.split(/\s+/).filter(Boolean)
+    const normalizedCommand = utteranceTokens[0]?.toLowerCase() || ''
+    const normalizedToolName = forcedToolName.toLowerCase()
+
+    if (
+      utteranceTokens.length < 2 ||
+      (normalizedCommand !== '/tool' && normalizedCommand !== '/t') ||
+      utteranceTokens[1]?.toLowerCase() !== normalizedToolName
+    ) {
+      return utterance
+    }
+
+    return utteranceTokens.slice(2).join(' ').trim()
+  }
+
+  private getRoutingDecision(forcedMode?: RoutingMode): {
     mode: RoutingMode
     route: RoutingRoute
     reason: string
   } {
-    const mode = this.getLeonMode()
+    const mode = this.resolveLeonMode(forcedMode)
 
     if (mode === RoutingMode.Agent) {
       return { mode, route: this.routingRoutes.react, reason: 'agent_mode' }
     }
 
-    if (mode === RoutingMode.Workflow) {
+    if (mode === RoutingMode.Controlled) {
       return {
         mode,
-        route: this.routingRoutes.workflow,
-        reason: 'workflow_mode'
+        route: this.routingRoutes.controlled,
+        reason: 'controlled_mode'
       }
     }
 
-    return { mode, route: this.routingRoutes.workflow, reason: 'smart_default' }
+    return { mode, route: this.routingRoutes.controlled, reason: 'smart_default' }
   }
 
-  private async runReAct(utterance: NLPUtterance): Promise<void> {
+  private async runReAct(
+    utterance: NLPUtterance,
+    agentSkillName?: NLPSkill,
+    forcedToolName?: string
+  ): Promise<void> {
     LogHelper.title('NLU')
     LogHelper.info('Routing to ReAct...')
     this._currentResponseRoute = 'react'
+    const agentSkillContext = agentSkillName
+      ? await SkillDomainHelper.getAgentSkillExecutionContext(agentSkillName)
+      : null
+
+    if (agentSkillName && !agentSkillContext) {
+      LogHelper.warning(
+        `Agent Skill "${agentSkillName}" could not be loaded. Continuing without active Agent Skill context.`
+      )
+    }
 
     const reactDuty = new ReActLLMDuty({
-      input: utterance
+      input: utterance,
+      agentSkill: agentSkillContext,
+      ...(forcedToolName ? { forcedToolName } : {})
     })
     await reactDuty.init()
     const reactResult = await reactDuty.execute()
@@ -714,57 +842,6 @@ export default class NLU {
             } => Boolean(item)
           )
       : []
-
-    if (output) {
-      const sentAt = Date.now()
-      void MEMORY_MANAGER.observeTurn({
-        userMessage: utterance,
-        assistantMessage: String(output),
-        sentAt,
-        route: 'react',
-        toolExecutions
-      }).catch((error: unknown) => {
-        LogHelper.title('NLU')
-        LogHelper.warning(`Failed to store turn memory: ${error}`)
-      })
-      void SELF_MODEL_MANAGER.observeTurn({
-        userMessage: utterance,
-        assistantMessage: String(output),
-        sentAt,
-        route: 'react',
-        finalIntent,
-        toolExecutions
-      }).catch((error: unknown) => {
-        LogHelper.title('NLU')
-        LogHelper.warning(`Failed to update self model: ${error}`)
-      })
-      void syncOwnerProfileFromTurn(
-        utterance,
-        String(output),
-        toolExecutions
-      ).catch((error: unknown) => {
-        LogHelper.title('NLU')
-        LogHelper.warning(`Failed to sync owner profile from turn: ${error}`)
-      })
-
-      if (!hasExplicitMemoryWrite) {
-        void MEMORY_MANAGER.savePersistentMemoryCandidatesFromTurn(
-          utterance,
-          String(output),
-          sentAt
-        ).catch((error: unknown) => {
-          LogHelper.title('NLU')
-          LogHelper.warning(
-            `Failed to save persistent memory candidates: ${error}`
-          )
-        })
-      } else {
-        LogHelper.title('NLU')
-        LogHelper.debug(
-          'Skipping automatic persistent extraction: explicit memory.write already executed in this turn'
-        )
-      }
-    }
 
     if (output && !BRAIN.isMuted) {
       await BRAIN.talk(
@@ -833,6 +910,67 @@ export default class NLU {
         true
       )
     }
+
+    if (output) {
+      const sentAt = Date.now()
+      void MEMORY_MANAGER.observeTurn({
+        userMessage: utterance,
+        assistantMessage: String(output),
+        sentAt,
+        route: 'react',
+        toolExecutions
+      }).catch((error: unknown) => {
+        LogHelper.title('NLU')
+        LogHelper.warning(`Failed to store turn memory: ${error}`)
+      })
+      POST_TURN_MAINTENANCE_QUEUE.enqueue(
+        'react self-model reflection',
+        () => SELF_MODEL_MANAGER.observeTurn({
+          userMessage: utterance,
+          assistantMessage: String(output),
+          sentAt,
+          route: 'react',
+          finalIntent,
+          toolExecutions
+        })
+      )
+      if (hasExplicitMemoryWrite) {
+        POST_TURN_MAINTENANCE_QUEUE.enqueue(
+          'owner profile sync',
+          () => syncOwnerProfileFromTurn(
+            utterance,
+            String(output),
+            toolExecutions
+          ).then(() => undefined)
+        )
+        LogHelper.title('NLU')
+        LogHelper.debug(
+          'Skipping automatic persistent extraction: explicit memory.write already executed in this turn'
+        )
+      } else {
+        POST_TURN_MAINTENANCE_QUEUE.enqueue(
+          'persistent memory extraction',
+          async () => {
+            const savedCount =
+              await MEMORY_MANAGER.savePersistentMemoryCandidatesFromTurn(
+                utterance,
+                String(output),
+                sentAt
+              )
+
+            if (savedCount === 0) {
+              return
+            }
+
+            await syncOwnerProfileFromTurn(
+              utterance,
+              String(output),
+              toolExecutions
+            )
+          }
+        )
+      }
+    }
   }
   private async runSkillWriterCreateSkill(
     utterance: NLPUtterance
@@ -863,21 +1001,21 @@ export default class NLU {
    * Ready to execute skill action, then once executed, prioritize:
    *
    * 1. Handle explicit jump to another action.
-   * This allows a skill to override any loop or flow logic.
+   * This allows a skill to override any loop or workflow logic.
    * E.g., a "replay" action telling the core to jump back to the "set_up" action.
    *
    * 2. Handle action loop logic.
    * An action with "is_loop" will repeat by default.
    * It will only break if the skill's code returns { "core": { "isInActionLoop": false } }.
    *
-   * 3. Handle standard flow logic.
+   * 3. Handle standard workflow logic.
    * This runs if there's no jump and the loop has been broken (or was never a loop).
    *
    * 4. Clean up.
    * This is the default case when an interaction is complete:
    * - No jump was requested.
    * - A loop was successfully broken.
-   * - The end of a flow was reached (or there was no flow).
+   * - The end of a workflow was reached (or there was no workflow).
    */
   private async handleActionSuccess(
     actionCallingOutput: ActionCallingSuccessOutput
@@ -942,7 +1080,7 @@ export default class NLU {
       })
 
       /**
-       * By returning here, we do not advance the flow.
+       * By returning here, we do not advance the workflow.
        * The current action remains and ready for the next user input
        */
       this.workflowProgress.completeAll()
@@ -951,19 +1089,19 @@ export default class NLU {
       return
     }
 
-    const { flow } = skillConfig
-    const hasFlow = flow && flow.length > 0
-    if (hasFlow) {
-      const shouldContinueFlow = await this.handleSkillFlow(flow)
+    const { workflow } = skillConfig
+    const hasWorkflow = workflow && workflow.length > 0
+    if (hasWorkflow) {
+      const shouldContinueWorkflow = await this.handleSkillWorkflow(workflow)
 
-      if (shouldContinueFlow) {
+      if (shouldContinueWorkflow) {
         this.emitDeferredSkillWidget(processedData)
         return
       }
     }
 
     /**
-     * If there is no flow or the flow has ended,
+     * If there is no workflow or the workflow has ended,
      * clean the state for the next utterance
      */
     this.conversation.cleanActiveState()
@@ -1170,6 +1308,9 @@ export default class NLU {
     utterance: NLPUtterance,
     options?: {
       ownerMessageId?: string
+      forcedRoutingMode?: RoutingMode
+      forcedSkillName?: NLPSkill
+      forcedToolName?: string
     }
   ): Promise<NLUPartialProcessResult | null> {
     // TODO: core rewrite
@@ -1183,6 +1324,14 @@ export default class NLU {
             LogHelper.title('NLU')
             LogHelper.info('Processing...')
             this.hasHandledProviderFailure = false
+            const workflowUtterance = this.getWorkflowUtterance(
+              utterance,
+              options?.forcedSkillName
+            )
+            const toolUtterance = this.getToolUtterance(
+              utterance,
+              options?.forcedToolName
+            )
 
             await CONVERSATION_LOGGER.push({
               who: 'owner',
@@ -1192,6 +1341,12 @@ export default class NLU {
                 ? { messageId: options.ownerMessageId }
                 : {})
             })
+            const currentSessionId =
+              CONVERSATION_SESSION_MANAGER.getCurrentSessionId()
+            CONVERSATION_SESSION_MANAGER.maybeSetFallbackTitle(
+              currentSessionId,
+              utterance
+            )
             void PULSE_MANAGER.observeOwnerUtterance(utterance).catch(
               (error: unknown) => {
                 LogHelper.title('NLU')
@@ -1203,7 +1358,7 @@ export default class NLU {
 
             await NLUProcessResultUpdater.update({
               new: {
-                utterance
+                utterance: workflowUtterance
               }
             })
 
@@ -1216,7 +1371,9 @@ export default class NLU {
               return resolve(null)
             }
 
-            const routingDecision = this.getRoutingDecision()
+            const routingDecision = this.getRoutingDecision(
+              options?.forcedRoutingMode
+            )
             LogHelper.title('NLU')
             LogHelper.info(
               `Routing decision: mode=${routingDecision.mode} route=${routingDecision.route} reason=${routingDecision.reason}`
@@ -1227,7 +1384,7 @@ export default class NLU {
             const isLLMDisabledForRoute =
               (routingDecision.route === this.routingRoutes.react &&
                 !modelState.getAgentTarget().isEnabled) ||
-              (routingDecision.route === this.routingRoutes.workflow &&
+              (routingDecision.route === this.routingRoutes.controlled &&
                 !modelState.getWorkflowTarget().isEnabled)
 
             if (isLLMDisabledForRoute) {
@@ -1243,7 +1400,21 @@ export default class NLU {
               this.workflowProgress.reset()
               this.conversation.cleanActiveState()
               await NLUProcessResultUpdater.update(DEFAULT_NLU_PROCESS_RESULT)
-              await this.runReAct(utterance)
+              const forcedSkillDescriptor = options?.forcedSkillName
+                ? SkillDomainHelper.getSkillDescriptorSync(
+                    options.forcedSkillName
+                  )
+                : null
+              const forcedAgentSkillName =
+                forcedSkillDescriptor?.format === SkillFormat.AgentSkill
+                  ? options?.forcedSkillName
+                  : undefined
+
+              await this.runReAct(
+                forcedAgentSkillName ? workflowUtterance : toolUtterance,
+                forcedAgentSkillName,
+                options?.forcedToolName
+              )
               return resolve(null)
             }
 
@@ -1253,11 +1424,15 @@ export default class NLU {
             }
 
             if (shouldPickSkillAction) {
-              this.workflowProgress.showChoosingSkill()
-              const chosenSkill = await this.chooseSkill(utterance)
-              if (this.hasHandledProviderFailure) {
-                this.workflowProgress.reset()
-                return resolve(null)
+              let chosenSkill = options?.forcedSkillName || null
+
+              if (!chosenSkill) {
+                this.workflowProgress.showChoosingSkill()
+                chosenSkill = await this.chooseSkill(workflowUtterance)
+                if (this.hasHandledProviderFailure) {
+                  this.workflowProgress.reset()
+                  return resolve(null)
+                }
               }
 
               const isSkillFound = !!chosenSkill
@@ -1274,14 +1449,16 @@ export default class NLU {
                 return
               }
 
+              const resolvedSkill = chosenSkill as string
+
               await NLUProcessResultUpdater.update({
-                skillName: chosenSkill
+                skillName: resolvedSkill
               })
               this.workflowProgress.showPickingAction()
 
               const parsedActionCallingOutputs = await this.chooseSkillAction(
-                utterance,
-                chosenSkill
+                workflowUtterance,
+                resolvedSkill
               )
               if (this.hasHandledProviderFailure) {
                 this.workflowProgress.reset()

@@ -31,21 +31,18 @@
     }
   },
   "volta": {
-    "node": "24.13.1"
-  },
-  "pnpm": {
-    "neverBuiltDependencies": []
+    "node": "24.15.0"
   },
   "scripts": {
     "pre-commit": "lint-staged",
     "lint": "tsx scripts/lint.js",
-    "test": "pnpm run test:agent:unit && pnpm run test:workflow:unit && pnpm run test:workflow:e2e",
+    "test": "pnpm run test:agent:unit && pnpm run test:controlled:unit && pnpm run test:controlled:e2e",
     "test:agent:unit": "cross-env LEON_NODE_ENV=testing tsx scripts/run-agent-vitest.ts unit",
     "test:agent:e2e": "cross-env LEON_NODE_ENV=testing tsx scripts/run-agent-vitest.ts e2e",
-    "test:workflow:unit": "cross-env LEON_NODE_ENV=testing vitest run --config vitest.config.ts test/workflow/unit",
-    "test:workflow:e2e": "cross-env LEON_NODE_ENV=testing vitest run --config vitest.config.ts test/workflow/e2e",
+    "test:controlled:unit": "cross-env LEON_NODE_ENV=testing vitest run --config vitest.config.ts test/controlled/unit",
+    "test:controlled:e2e": "cross-env LEON_NODE_ENV=testing vitest run --config vitest.config.ts test/controlled/e2e",
     "preinstall": "node scripts/setup/preinstall.js",
-    "postinstall": "tsx scripts/setup/setup.js",
+    "postinstall": "node scripts/setup/run-setup.js",
     "dev:app": "vite --config app/vite.config.js",
     "dev:aurora": "vite --config aurora/preview/vite.config.js --open",
     "dev:server": "pnpm --silent run train && cross-env LEON_NODE_ENV=development nodemon",
@@ -66,7 +63,6 @@
     "python-bridge": "tsx scripts/run-python-bridge.js server/src/intent-object.sample.json",
     "train": "tsx scripts/train/run-train.js",
     "prepare-release": "tsx scripts/release/prepare-release.js",
-    "sync-skill-deps": "tsx scripts/sync-skill-deps.js",
     "check": "tsx scripts/check.js",
     "kill": "tsx scripts/kill.js"
   },
@@ -79,10 +75,10 @@
     "@ai-sdk/openai": "3.0.52",
     "@ai-sdk/openai-compatible": "2.0.41",
     "@ark-ui/react": "5.36.0",
-    "@fastify/static": "9.1.0",
+    "@fastify/static": "9.1.3",
     "@ffprobe-installer/ffprobe": "2.1.2",
     "@fontsource/source-sans-pro": "5.2.5",
-    "@openrouter/ai-sdk-provider": "2.5.1",
+    "@openrouter/ai-sdk-provider": "2.9.0",
     "@segment/ajv-human-errors": "2.16.0",
     "@sinclair/typebox": "0.31.23",
     "@tobilu/qmd": "2.1.0",
@@ -98,7 +94,7 @@
     "dayjs": "1.11.20",
     "dotenv": "16.4.5",
     "execa": "5.1.1",
-    "fastify": "5.8.4",
+    "fastify": "5.8.5",
     "ffmpeg-static": "5.2.0",
     "fluent-ffmpeg": "2.1.3",
     "getos": "3.2.1",
@@ -111,7 +107,8 @@
     "remixicon": "4.9.1",
     "socket.io": "4.7.5",
     "socket.io-client": "4.7.5",
-    "tree-kill": "1.2.2"
+    "tree-kill": "1.2.2",
+    "yaml": "2.8.3"
   },
   "devDependencies": {
     "@eslint/compat": "1.2.3",
@@ -120,6 +117,7 @@
     "@stylistic/eslint-plugin": "5.10.0",
     "@tsconfig/node16": "16.1.8",
     "@tsconfig/strictest": "2.0.8",
+    "@types/better-sqlite3": "7.6.13",
     "@types/cli-spinner": "0.2.3",
     "@types/fluent-ffmpeg": "2.1.28",
     "@types/getos": "3.0.4",

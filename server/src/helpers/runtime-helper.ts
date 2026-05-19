@@ -1,13 +1,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { LEON_HOME_PATH } from '@/leon-roots'
 import { SystemHelper } from '@/helpers/system-helper'
 
 export class RuntimeHelper {
   /**
    * Resolve Leon-managed runtime binaries from the local `bin/` directory first.
    */
-  private static readonly binPath = path.join(process.cwd(), 'bin')
+  private static readonly binPath = path.join(LEON_HOME_PATH, 'bin')
 
   /**
    * Pick the first runtime candidate that already exists on disk.
@@ -46,6 +47,45 @@ export class RuntimeHelper {
    */
   private static escapeShellArgument(value: string): string {
     return `"${value.replaceAll('"', '\\"')}"`
+  }
+
+  private static buildManagedRuntimeShellFunction(
+    name: string,
+    executablePath: string
+  ): string {
+    const escapedExecutablePath = this.escapeShellArgument(executablePath)
+
+    return [
+      `${name}() {`,
+      `  if [ -x ${escapedExecutablePath} ]; then`,
+      `    ${escapedExecutablePath} "$@"`,
+      '  else',
+      `    command ${name} "$@"`,
+      '  fi',
+      '}'
+    ].join('\n')
+  }
+
+  private static escapePowerShellSingleQuotedString(value: string): string {
+    return `'${value.replaceAll('\'', '\'\'')}'`
+  }
+
+  private static buildManagedRuntimePowerShellFunction(
+    name: string,
+    executablePath: string
+  ): string {
+    const escapedExecutablePath =
+      this.escapePowerShellSingleQuotedString(executablePath)
+
+    return [
+      `function ${name} {`,
+      `  if (Test-Path -LiteralPath ${escapedExecutablePath}) {`,
+      `    & ${escapedExecutablePath} @args`,
+      '  } else {',
+      `    & ${name} @args`,
+      '  }',
+      '}'
+    ].join('\n')
   }
 
   /**
@@ -128,6 +168,46 @@ export class RuntimeHelper {
   }
 
   /**
+   * Render shell functions that make temp scripts call Leon-managed runtimes
+   * explicitly instead of resolving bare commands through PATH.
+   */
+  public static buildManagedRuntimeShellFunctions(): string {
+    const functions: Array<[string, string]> = [
+      ['node', this.getNodeBinPath()],
+      ['python', this.getPythonBinPath()],
+      ['python3', this.getPythonBinPath()],
+      ['pnpm', this.getPNPMBinPath()],
+      ['uv', this.getUVBinPath()]
+    ]
+
+    return functions
+      .map(([name, executablePath]) =>
+        this.buildManagedRuntimeShellFunction(name, executablePath)
+      )
+      .join('\n\n')
+  }
+
+  /**
+   * Render PowerShell functions that make temp scripts call Leon-managed
+   * runtimes explicitly instead of resolving bare commands through PATH.
+   */
+  public static buildManagedRuntimePowerShellFunctions(): string {
+    const functions: Array<[string, string]> = [
+      ['node', this.getNodeBinPath()],
+      ['python', this.getPythonBinPath()],
+      ['python3', this.getPythonBinPath()],
+      ['pnpm', this.getPNPMBinPath()],
+      ['uv', this.getUVBinPath()]
+    ]
+
+    return functions
+      .map(([name, executablePath]) =>
+        this.buildManagedRuntimePowerShellFunction(name, executablePath)
+      )
+      .join('\n\n')
+  }
+
+  /**
    * Resolve the Python binary Leon should use for bridges and skills.
    */
   public static getPythonBinPath(): string {
@@ -205,28 +285,6 @@ export class RuntimeHelper {
     ]
 
     return this.firstExistingPath(venvCandidates) || this.getPythonBinPath()
-  }
-
-  /**
-   * Keep skill-owned runtime artifacts out of `src` so install/update can clean
-   * them up independently from skill source files.
-   */
-  public static getSkillRuntimePath(skillPath: string): string {
-    return path.join(skillPath, '.runtime')
-  }
-
-  /**
-   * Resolve the runtime node_modules directory for a Node.js skill.
-   */
-  public static getNodejsSkillRuntimeNodeModulesPath(skillPath: string): string {
-    return path.join(this.getSkillRuntimePath(skillPath), 'node_modules')
-  }
-
-  /**
-   * Resolve the vendored Python dependency directory for a Python skill.
-   */
-  public static getPythonSkillRuntimeVendorPath(skillPath: string): string {
-    return path.join(this.getSkillRuntimePath(skillPath), 'vendor')
   }
 
   /**

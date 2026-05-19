@@ -33,8 +33,8 @@ importers:
         specifier: 5.36.0
         version: 5.36.0(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       '@fastify/static':
-        specifier: 9.1.0
-        version: 9.1.0
+        specifier: 9.1.3
+        version: 9.1.3
       '@ffprobe-installer/ffprobe':
         specifier: 2.1.2
         version: 2.1.2
@@ -42,8 +42,8 @@ importers:
         specifier: 5.2.5
         version: 5.2.5
       '@openrouter/ai-sdk-provider':
-        specifier: 2.5.1
-        version: 2.5.1(ai@6.0.158(zod@4.3.6))(zod@4.3.6)
+        specifier: 2.9.0
+        version: 2.9.0(ai@6.0.158(zod@4.3.6))(zod@4.3.6)
       '@segment/ajv-human-errors':
         specifier: 2.16.0
         version: 2.16.0(ajv@8.18.0)
@@ -90,8 +90,8 @@ importers:
         specifier: 5.1.1
         version: 5.1.1
       fastify:
-        specifier: 5.8.4
-        version: 5.8.4
+        specifier: 5.8.5
+        version: 5.8.5
       ffmpeg-static:
         specifier: 5.2.0
         version: 5.2.0
@@ -131,6 +131,9 @@ importers:
       tree-kill:
         specifier: 1.2.2
         version: 1.2.2
+      yaml:
+        specifier: 2.8.3
+        version: 2.8.3
     devDependencies:
       '@eslint/compat':
         specifier: 1.2.3
@@ -150,6 +153,9 @@ importers:
       '@tsconfig/strictest':
         specifier: 2.0.8
         version: 2.0.8
+      '@types/better-sqlite3':
+        specifier: 7.6.13
+        version: 7.6.13
       '@types/cli-spinner':
         specifier: 0.2.3
         version: 0.2.3
@@ -717,8 +723,8 @@ packages:
   '@fastify/send@4.1.0':
     resolution: {integrity: sha512-TMYeQLCBSy2TOFmV95hQWkiTYgC/SEx7vMdV+wnZVX4tt8VBLKzmH8vV9OzJehV0+XBfg+WxPMt5wp+JBUKsVw==}
 
-  '@fastify/static@9.1.0':
-    resolution: {integrity: sha512-EPRNQYqEYEYTK8yyGbcM0iHpyJaupb94bey5O6iCQfLTADr02kaZU+qeHSdd9H9TiMwTBVkrMa59V8CMbn3avQ==}
+  '@fastify/static@9.1.3':
+    resolution: {integrity: sha512-aXrYtsiryLhRxRNaxNqsn7FUISeb7rB9q4eHUPIot5aeQBLNahnz1m6thzm7JWC1poSGXS9XrX8DvuMivp2hkQ==}
 
   '@ffprobe-installer/darwin-arm64@5.0.1':
     resolution: {integrity: sha512-vwNCNjokH8hfkbl6m95zICHwkSzhEvDC3GVBcUp5HX8+4wsX10SP3B+bGur7XUzTIZ4cQpgJmEIAx6TUwRepMg==}
@@ -940,8 +946,8 @@ packages:
     resolution: {integrity: sha512-oGB+UxlgWcgQkgwo8GcEGwemoTFt3FIO9ababBmaGwXIoBKZ+GTy0pP185beGg7Llih/NSHSV2XAs1lnznocSg==}
     engines: {node: '>= 8'}
 
-  '@openrouter/ai-sdk-provider@2.5.1':
-    resolution: {integrity: sha512-r1fJL1Cb3gQDa2MpWH/sfx1BsEW0uzlRriJM6eihaKqbtKDmZoBisF32VcVaQYassighX7NGCkF68EsrZA43uQ==}
+  '@openrouter/ai-sdk-provider@2.9.0':
+    resolution: {integrity: sha512-Seva+NCa0WUQnJIUE5GzHsUv1WTIeyqwz0ELl2VtS6NP+eF+77yCXGFVOMbvoCM7QMjlnhv7931e89R+8pJdcQ==}
     engines: {node: '>=18'}
     peerDependencies:
       ai: ^6.0.0
@@ -1163,6 +1169,9 @@ packages:
 
   '@tybys/wasm-util@0.10.1':
     resolution: {integrity: sha512-9tTaPJLSiejZKx+Bmog4uSubteqTvFrVrURwkmHixBo0G4seD0zUxp98E1DzUBJxLQ3NPwXrGKDiVjwx/DpPsg==}
+
+  '@types/better-sqlite3@7.6.13':
+    resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
 
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
@@ -2527,8 +2536,8 @@ packages:
   fastify-plugin@5.1.0:
     resolution: {integrity: sha512-FAIDA8eovSt5qcDgcBvDuX/v0Cjz0ohGhENZ/wpc3y+oZCY2afZ9Baqql3g/lC+OHRnciQol4ww7tuthOb9idw==}
 
-  fastify@5.8.4:
-    resolution: {integrity: sha512-sa42J1xylbBAYUWALSBoyXKPDUvM3OoNOibIefA+Oha57FryXKKCZarA1iDntOCWp3O35voZLuDg2mdODXtPzQ==}
+  fastify@5.8.5:
+    resolution: {integrity: sha512-Yqptv59pQzPgQUSIm87hMqHJmdkb1+GPxdE6vW6FRyVE9G86mt7rOghitiU4JHRaTyDUk9pfeKmDeu70lAwM4Q==}
 
   fastq@1.18.0:
     resolution: {integrity: sha512-QKHXPW0hD8g4UET03SdOdunzSouc9N4AuHdsX8XNcTsuz+yYFILVNIX4l9yHABMhiEI9Db0JTTIpu0wB+Y1QQw==}
@@ -5109,7 +5118,7 @@ snapshots:
       http-errors: 2.0.1
       mime: 3.0.0
 
-  '@fastify/static@9.1.0':
+  '@fastify/static@9.1.3':
     dependencies:
       '@fastify/accept-negotiator': 2.0.1
       '@fastify/send': 4.1.0
@@ -5294,7 +5303,7 @@ snapshots:
       '@nodelib/fs.scandir': 2.1.5
       fastq: 1.18.0
 
-  '@openrouter/ai-sdk-provider@2.5.1(ai@6.0.158(zod@4.3.6))(zod@4.3.6)':
+  '@openrouter/ai-sdk-provider@2.9.0(ai@6.0.158(zod@4.3.6))(zod@4.3.6)':
     dependencies:
       ai: 6.0.158(zod@4.3.6)
       zod: 4.3.6
@@ -5460,6 +5469,10 @@ snapshots:
     dependencies:
       tslib: 2.8.1
     optional: true
+
+  '@types/better-sqlite3@7.6.13':
+    dependencies:
+      '@types/node': 25.6.0
 
   '@types/chai@5.2.3':
     dependencies:
@@ -7331,7 +7344,7 @@ snapshots:
 
   fastify-plugin@5.1.0: {}
 
-  fastify@5.8.4:
+  fastify@5.8.5:
     dependencies:
       '@fastify/ajv-compiler': 4.0.5
       '@fastify/error': 4.2.0

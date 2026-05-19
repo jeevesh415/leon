@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 
 import { requestBuiltInCommand } from './api'
 import { BuiltInCommandsModal } from './modal'
+import FileSystemAutocomplete from '../file-system-autocomplete'
 
 const AUTOCOMPLETE_DELAY_MS = 90
 const CLOSE_ANIMATION_DURATION_MS = 180
@@ -28,9 +29,18 @@ function isEditableElement(element) {
 }
 
 export default class BuiltInCommands {
-  constructor({ serverUrl, input }) {
+  constructor({
+    serverUrl,
+    input,
+    onSubmitToChat,
+    getActiveSessionId,
+    onCommandExecuted
+  }) {
     this.serverUrl = serverUrl
     this.input = input
+    this.onSubmitToChat = onSubmitToChat
+    this.getActiveSessionId = getActiveSessionId
+    this.onCommandExecuted = onCommandExecuted
     this.sessionId = null
     this.origin = 'shortcut'
     this.commandValue = ''
@@ -48,6 +58,12 @@ export default class BuiltInCommands {
     this.closeTimeout = null
     this.shouldFocusInput = false
     this.modalInputRef = createRef()
+    this.fileSystemAutocomplete = new FileSystemAutocomplete({
+      serverUrl,
+      onValueChange: (value) => {
+        this.handleCommandChange(value)
+      }
+    })
   }
 
   init() {
@@ -77,6 +93,15 @@ export default class BuiltInCommands {
   }
 
   render() {
+    const focusedInputElement = this.modalInputRef.current
+    const shouldRestoreCommandInputFocus =
+      focusedInputElement && document.activeElement === focusedInputElement
+    const selectionStart = shouldRestoreCommandInputFocus
+      ? focusedInputElement.selectionStart
+      : null
+    const selectionEnd = shouldRestoreCommandInputFocus
+      ? focusedInputElement.selectionEnd
+      : null
     const { recentSelectedSuggestionIndex, suggestionSelectedSuggestionIndex } =
       this.getSelectedSuggestionIndices()
 
@@ -116,6 +141,10 @@ export default class BuiltInCommands {
       window.requestAnimationFrame(() => {
         this.focusCommandInput()
       })
+    } else if (shouldRestoreCommandInputFocus) {
+      window.requestAnimationFrame(() => {
+        this.restoreCommandInputFocus(selectionStart, selectionEnd)
+      })
     }
 
     if (
@@ -128,6 +157,20 @@ export default class BuiltInCommands {
         this.scrollSelectedSuggestionIntoView()
       })
     }
+
+    window.requestAnimationFrame(() => {
+      this.attachFileSystemAutocomplete()
+    })
+  }
+
+  attachFileSystemAutocomplete() {
+    const inputElement = this.modalInputRef.current
+
+    if (!inputElement) {
+      return
+    }
+
+    this.fileSystemAutocomplete.attach(inputElement)
   }
 
   handleDocumentKeyDown(event) {
@@ -153,6 +196,22 @@ export default class BuiltInCommands {
         event.preventDefault()
         this.blurCommandInput()
         this.moveSelection(NAVIGATION_DIRECTIONS.previous)
+        return
+      }
+
+      if (event.key === 'Tab') {
+        const suggestion =
+          this.selectedSuggestionIndex >= 0
+            ? this.getVisibleSuggestions()[this.selectedSuggestionIndex]
+            : null
+
+        if (suggestion) {
+          event.preventDefault()
+          this.applySuggestion(suggestion, {
+            appendTrailingSpace: true
+          })
+        }
+
         return
       }
 
@@ -283,11 +342,13 @@ export default class BuiltInCommands {
 
     this.isClosing = true
     this.isOpen = false
+    this.fileSystemAutocomplete.close()
     this.render()
 
     this.closeTimeout = window.setTimeout(() => {
       this.resetState()
       this.render()
+      this.focusMainInput()
     }, CLOSE_ANIMATION_DURATION_MS)
   }
 
@@ -305,7 +366,8 @@ export default class BuiltInCommands {
       const data = await requestBuiltInCommand(this.serverUrl, {
         mode: 'autocomplete',
         input: this.buildCommandInput(),
-        session_id: this.sessionId
+        session_id: this.sessionId,
+        conversation_session_id: this.getActiveSessionId?.()
       })
 
       if (!this.isOpen || this.hasSubmitted) {
@@ -371,12 +433,26 @@ export default class BuiltInCommands {
       const data = await requestBuiltInCommand(this.serverUrl, {
         mode: 'execute',
         input: commandInput,
-        session_id: this.sessionId
+        session_id: this.sessionId,
+        conversation_session_id: this.getActiveSessionId?.()
       })
+
+      if (data.client_action?.type === 'submit_to_chat') {
+        const wasSubmitted = this.onSubmitToChat?.(data.client_action)
+
+        if (!wasSubmitted) {
+          throw new Error('Failed to submit the built-in command to chat.')
+        }
+
+        this.isLoading = false
+        this.close()
+        return
+      }
 
       this.sessionId = data.session.id
       this.isLoading = false
       this.result = data.result
+      this.onCommandExecuted?.(commandInput, data)
       this.loadingMessage = data.session.loading_message || null
       this.recentSuggestions = data.recent_suggestions || []
       this.pendingInput = data.session.pending_input || null
@@ -410,7 +486,8 @@ export default class BuiltInCommands {
       const data = await requestBuiltInCommand(this.serverUrl, {
         mode: 'autocomplete',
         input: commandInput,
-        session_id: this.sessionId
+        session_id: this.sessionId,
+        conversation_session_id: this.getActiveSessionId?.()
       })
 
       this.sessionId = data.session.id
@@ -447,16 +524,20 @@ export default class BuiltInCommands {
   handleSuggestionSelect(suggestion) {
     const normalizedSuggestionValue = this.normalizeCommandValue(suggestion.value)
 
-    if (normalizedSuggestionValue === this.commandValue) {
+    if (normalizedSuggestionValue.trim() === this.commandValue.trim()) {
       void this.submit()
       return
     }
 
-    this.applySuggestion(suggestion)
+    this.applySuggestion(suggestion, {
+      appendTrailingSpace: true
+    })
   }
 
-  applySuggestion(suggestion) {
-    this.commandValue = this.normalizeCommandValue(suggestion.value)
+  applySuggestion(suggestion, options = {}) {
+    this.commandValue = `${this.normalizeCommandValue(suggestion.value)}${
+      options.appendTrailingSpace ? ' ' : ''
+    }`
     this.loadingMessage = null
     this.queueAutocomplete()
     this.shouldFocusInput = true
@@ -494,6 +575,30 @@ export default class BuiltInCommands {
     }
   }
 
+  restoreCommandInputFocus(selectionStart, selectionEnd) {
+    const inputElement = this.modalInputRef.current
+
+    if (!inputElement) {
+      return
+    }
+
+    if (document.activeElement !== inputElement) {
+      try {
+        inputElement.focus({ preventScroll: true })
+      } catch {
+        inputElement.focus()
+      }
+    }
+
+    if (
+      typeof inputElement.setSelectionRange === 'function' &&
+      selectionStart !== null &&
+      selectionEnd !== null
+    ) {
+      inputElement.setSelectionRange(selectionStart, selectionEnd)
+    }
+  }
+
   blurCommandInput() {
     const inputElement = this.modalInputRef.current
 
@@ -502,6 +607,27 @@ export default class BuiltInCommands {
     }
 
     inputElement.blur()
+  }
+
+  focusMainInput() {
+    if (!this.input) {
+      return
+    }
+
+    window.requestAnimationFrame(() => {
+      try {
+        this.input.focus({ preventScroll: true })
+      } catch {
+        this.input.focus()
+      }
+
+      if (typeof this.input.setSelectionRange === 'function') {
+        this.input.setSelectionRange(
+          this.input.value.length,
+          this.input.value.length
+        )
+      }
+    })
   }
 
   scrollSelectedSuggestionIntoView() {

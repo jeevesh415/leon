@@ -9,11 +9,13 @@ import kill from 'tree-kill'
 
 import AISDKRemoteLLMProvider from '@/core/llm-manager/llm-providers/ai-sdk-remote-llm-provider'
 import type { ResolvedLLMTarget } from '@/core/llm-manager/llm-routing'
+import { CONFIG_MANAGER } from '@/config'
 import type {
   CompletionParams,
   PromptOrChatHistory
 } from '@/core/llm-manager/types'
 import {
+  CODEBASE_PATH,
   LLAMACPP_BUILD_PATH,
   LLAMACPP_BUILD_MANIFEST_PATH,
   LLAMACPP_PATH,
@@ -21,18 +23,28 @@ import {
   LLAMACPP_SOURCE_BUILD_PATH,
   LLAMACPP_SOURCE_MANIFEST_PATH,
   LLAMACPP_SOURCE_PATH,
-  LOGS_PATH
+  PROFILE_LOGS_PATH
 } from '@/constants'
 import { LogHelper } from '@/helpers/log-helper'
 import { SystemHelper } from '@/helpers/system-helper'
 
 const DEFAULT_LLAMACPP_BASE_URL =
-  process.env['LEON_LLAMACPP_BASE_URL'] || 'http://127.0.0.1:8080/v1'
+  CONFIG_MANAGER.getProviderBaseURL('llamacpp') || 'http://127.0.0.1:8080/v1'
 const LLAMACPP_READY_TIMEOUT_MS = 120_000
 const LLAMACPP_READY_POLL_INTERVAL_MS = 250
 const LLAMA_SERVER_LOG_RESET_INTERVAL_MS = 12 * 60 * 60 * 1_000
 const LLAMACPP_MAX_PORT_CHECKS = 10
-const LLAMA_SERVER_LOG_PATH = path.join(LOGS_PATH, 'llama-server.log')
+const LLAMA_SERVER_LOG_PATH = path.join(
+  PROFILE_LOGS_PATH,
+  'llama-server.log'
+)
+const LLAMACPP_DISABLE_THINKING_CHAT_TEMPLATE_KWARGS = {
+  enable_thinking: false
+}
+const LLAMACPP_ENABLE_THINKING_CHAT_TEMPLATE_KWARGS = {
+  enable_thinking: true
+}
+const LLAMACPP_DISABLE_THINKING_REASONING_FORMAT = 'none'
 
 function wait(delayMs: number): Promise<void> {
   return new Promise((resolve) => {
@@ -169,7 +181,45 @@ function resolveModelPath(modelPath: string): string {
 
   return path.isAbsolute(normalizedModelPath)
     ? normalizedModelPath
-    : path.resolve(process.cwd(), normalizedModelPath)
+    : path.resolve(CODEBASE_PATH, normalizedModelPath)
+}
+
+function disableThinkingForStructuredRequest(
+  args: Record<string, unknown>
+): Record<string, unknown> {
+  const hasTools = Array.isArray(args['tools'])
+  const hasResponseFormat = Boolean(args['response_format'])
+  const shouldStream = args['stream'] === true
+
+  if (!hasTools && !hasResponseFormat) {
+    return args
+  }
+
+  const existingChatTemplateKwargs =
+    args['chat_template_kwargs'] &&
+    typeof args['chat_template_kwargs'] === 'object' &&
+    !Array.isArray(args['chat_template_kwargs'])
+      ? (args['chat_template_kwargs'] as Record<string, unknown>)
+      : {}
+
+  if (shouldStream) {
+    return {
+      ...args,
+      chat_template_kwargs: {
+        ...existingChatTemplateKwargs,
+        ...LLAMACPP_ENABLE_THINKING_CHAT_TEMPLATE_KWARGS
+      }
+    }
+  }
+
+  return {
+    ...args,
+    chat_template_kwargs: {
+      ...existingChatTemplateKwargs,
+      ...LLAMACPP_DISABLE_THINKING_CHAT_TEMPLATE_KWARGS
+    },
+    reasoning_format: LLAMACPP_DISABLE_THINKING_REASONING_FORMAT
+  }
 }
 
 /**
@@ -197,13 +247,14 @@ export default class LlamaCPPLLMProvider extends AISDKRemoteLLMProvider {
         model: target.model,
         baseURL: LlamaCPPLLMProvider.runtimeBaseURL,
         flavor: 'openai-compatible',
-        requiresApiKey: false
+        requiresApiKey: false,
+        transformRequestBody: disableThinkingForStructuredRequest
       }
     )
 
     if (!this.model.trim()) {
       throw new Error(
-        'llama.cpp model path is not defined. Please configure LEON_LLM or install a default local LLM.'
+        'llama.cpp model path is not defined. Please configure llm.default in config.yml or install a default local LLM.'
       )
     }
 
@@ -249,7 +300,7 @@ export default class LlamaCPPLLMProvider extends AISDKRemoteLLMProvider {
 
     if (completionParams.shouldStream === true && isPlainTextRequest) {
       LogHelper.title('llama.cpp LLM Provider')
-      LogHelper.info(
+      LogHelper.debug(
         'Using direct llama.cpp streaming chat completion for plain-text request.'
       )
 
@@ -258,7 +309,7 @@ export default class LlamaCPPLLMProvider extends AISDKRemoteLLMProvider {
 
     if (completionParams.shouldStream !== true && isPlainTextRequest) {
       LogHelper.title('llama.cpp LLM Provider')
-      LogHelper.info(
+      LogHelper.debug(
         'Using direct non-stream llama.cpp chat completion for plain-text request.'
       )
 
@@ -327,9 +378,9 @@ export default class LlamaCPPLLMProvider extends AISDKRemoteLLMProvider {
 
     if (completionParams.disableThinking === true) {
       payload['chat_template_kwargs'] = {
-        enable_thinking: false
+        ...LLAMACPP_DISABLE_THINKING_CHAT_TEMPLATE_KWARGS
       }
-      payload['reasoning_format'] = 'none'
+      payload['reasoning_format'] = LLAMACPP_DISABLE_THINKING_REASONING_FORMAT
     }
 
     return payload
@@ -341,7 +392,9 @@ export default class LlamaCPPLLMProvider extends AISDKRemoteLLMProvider {
     return {
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env['LEON_LLAMACPP_API_KEY'] || 'Bearer no-key'}`
+        Authorization: `Bearer ${
+          CONFIG_MANAGER.getProviderAPIKey('llamacpp') || 'Bearer no-key'
+        }`
       },
       ...(typeof completionParams.timeout === 'number'
         ? { timeout: completionParams.timeout }
@@ -742,7 +795,8 @@ export default class LlamaCPPLLMProvider extends AISDKRemoteLLMProvider {
       ],
       {
         cwd: process.cwd(),
-        env: process.env
+        env: process.env,
+        windowsHide: true
       }
     )
 
@@ -950,7 +1004,7 @@ export default class LlamaCPPLLMProvider extends AISDKRemoteLLMProvider {
     if (!this.serverLogStream) {
       const { flags, nextResetAt } = this.getServerLogOpenState(now)
 
-      fs.mkdirSync(LOGS_PATH, { recursive: true })
+      fs.mkdirSync(PROFILE_LOGS_PATH, { recursive: true })
       this.serverLogStream = fs.createWriteStream(LLAMA_SERVER_LOG_PATH, {
         flags
       })

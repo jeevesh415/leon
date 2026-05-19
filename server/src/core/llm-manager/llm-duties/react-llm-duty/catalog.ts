@@ -8,6 +8,8 @@ import type { Catalog, FunctionConfig } from './types'
 
 export function buildCatalog(): Catalog {
   const flattenedTools = TOOLKIT_REGISTRY.getFlattenedTools()
+  const unavailableTools = TOOLKIT_REGISTRY.getUnavailableTools()
+  const unavailableToolsSection = buildUnavailableToolsSection()
 
   // First try function-level catalog
   const functionLines: string[] = []
@@ -48,7 +50,7 @@ export function buildCatalog(): Catalog {
 
   if (estimatedTokens <= CATALOG_TOKEN_BUDGET) {
     return {
-      text: `Available Functions:\n${functionCatalog}`,
+      text: `Available Functions:\n${functionCatalog}${unavailableToolsSection}`,
       mode: 'function'
     }
   }
@@ -62,7 +64,29 @@ export function buildCatalog(): Catalog {
   }
 
   return {
-    text: `Available Tools:\n${toolLines.join('\n')}`,
+    text: `Available Tools:\n${toolLines.join('\n')}${unavailableToolsSection}`,
     mode: 'tool'
+  }
+
+  function buildUnavailableToolsSection(): string {
+    if (unavailableTools.length === 0) {
+      return ''
+    }
+
+    const unavailableLines = unavailableTools.map((tool) => {
+      if (tool.missingSettings.length > 0 && tool.settingsPath) {
+        return `- ${tool.toolkitId}.${tool.toolId}: missing ${tool.missingSettings.join(', ')}; configure ${tool.settingsPath}`
+      }
+
+      return `- ${tool.toolkitId}.${tool.toolId}: ${tool.reason || 'not available in the current runtime'}`
+    })
+
+    return [
+      '',
+      '',
+      'Unavailable Installed Tools:',
+      'These tools are installed but not callable right now. Do not plan them as executable steps; if the owner explicitly asks for one, explain the listed reason or missing settings path.',
+      ...unavailableLines
+    ].join('\n')
   }
 }

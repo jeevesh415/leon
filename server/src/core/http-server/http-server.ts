@@ -6,6 +6,7 @@ import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 
 import {
+  CODEBASE_PATH,
   API_VERSION,
   LEON_VERSION,
   LEON_NODE_ENV,
@@ -24,9 +25,11 @@ import { fetchWidgetPlugin } from '@/core/http-server/api/fetch-widget'
 import { conversationHistoryPlugin } from '@/core/http-server/api/conversation-history'
 import { commandPlugin } from '@/core/http-server/api/command'
 import { systemWidgetsPlugin } from '@/core/http-server/api/system-widgets'
+import { sessionsPlugin } from '@/core/http-server/api/sessions'
 import { keyMidd } from '@/core/http-server/plugins/key'
 import { utterancePlugin } from '@/core/http-server/api/utterance'
 import { openPathPlugin } from '@/core/http-server/api/open-path'
+import { fileSystemListPlugin } from '@/core/http-server/api/file-system-list'
 import { PERSONA } from '@/core'
 import { SystemHelper } from '@/helpers/system-helper'
 import { getRoutingModeLLMDisplay } from '@/core/llm-manager/llm-routing'
@@ -163,7 +166,7 @@ export default class HTTPServer {
   private async bootstrap(): Promise<void> {
     // Render the web app
     this.fastify.register(fastifyStatic, {
-      root: join(process.cwd(), 'app', 'dist'),
+      root: join(CODEBASE_PATH, 'app', 'dist'),
       prefix: '/'
     })
     this.fastify.get('/', (_request, reply) => {
@@ -176,10 +179,12 @@ export default class HTTPServer {
       apiVersion: API_VERSION
     })
     this.fastify.register(systemWidgetsPlugin, { apiVersion: API_VERSION })
+    this.fastify.register(sessionsPlugin, { apiVersion: API_VERSION })
     this.fastify.register(infoPlugin, { apiVersion: API_VERSION })
     this.fastify.register(commandPlugin, { apiVersion: API_VERSION })
     this.fastify.register(inferencePlugin, { apiVersion: API_VERSION })
     this.fastify.register(openPathPlugin, { apiVersion: API_VERSION })
+    this.fastify.register(fileSystemListPlugin, { apiVersion: API_VERSION })
 
     if (HAS_OVER_HTTP) {
       this.fastify.register((instance, _opts, next) => {

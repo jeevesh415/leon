@@ -1,13 +1,11 @@
-import { LEON_MOOD } from '@/constants'
+import { CONFIG_MANAGER } from '@/config'
 import {
   CONFIG_STATE_EVENT_EMITTER,
   MOOD_CONFIGURATION_UPDATED_EVENT
 } from '@/core/config-states/config-state-event-emitter'
-import { DotEnvHelper } from '@/helpers/dotenv-helper'
 import { Moods } from '@/types'
 
 const DEFAULT_CONFIGURED_MOOD = 'auto'
-const MOOD_ENV_KEY = 'LEON_MOOD'
 const SUPPORTED_MOOD_VALUES = [
   DEFAULT_CONFIGURED_MOOD,
   Moods.Default,
@@ -75,7 +73,8 @@ export function pickAutomaticMood(input?: {
 
 export class MoodState {
   private configuredMood: ConfiguredMood =
-    normalizeConfiguredMood(LEON_MOOD) || DEFAULT_CONFIGURED_MOOD
+    normalizeConfiguredMood(CONFIG_MANAGER.getConfig().mood.mode) ||
+    DEFAULT_CONFIGURED_MOOD
 
   private currentMood: Moods =
     this.configuredMood === DEFAULT_CONFIGURED_MOOD
@@ -112,9 +111,11 @@ export class MoodState {
       normalizedConfiguredMood === DEFAULT_CONFIGURED_MOOD
         ? pickAutomaticMood()
         : normalizedConfiguredMood
-    process.env[MOOD_ENV_KEY] = normalizedConfiguredMood
 
-    await DotEnvHelper.updateVariable(MOOD_ENV_KEY, normalizedConfiguredMood)
+    await CONFIG_MANAGER.setValue(
+      ['mood', 'mode'],
+      normalizedConfiguredMood
+    )
 
     CONFIG_STATE_EVENT_EMITTER.emit(MOOD_CONFIGURATION_UPDATED_EVENT, {
       configuredMood: this.configuredMood,

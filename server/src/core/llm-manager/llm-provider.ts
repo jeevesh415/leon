@@ -103,8 +103,12 @@ export default class LLMProvider {
 
   private workflowLLMProvider: Provider | undefined = undefined
   private agentLLMProvider: Provider | undefined = undefined
+  private workflowLLMProviderTargetLabel: string | null = null
+  private agentLLMProviderTargetLabel: string | null = null
+  private readonly sessionLLMProviders = new Map<string, Provider>()
   private lastProviderErrorMessage: string | null = null
   private llamaCPPServerBootErrorMessage: string | null = null
+  private promptSequence = 0
 
   constructor() {
     if (!LLMProvider.instance) {
@@ -138,9 +142,12 @@ export default class LLMProvider {
   }
 
   public get localLLMName(): string {
-    const workflowProviderName = this.getProviderNameForDuty(null)
-    const agentProviderName = this.getProviderNameForDuty(LLMDuties.ReAct)
+    const modelState = CONFIG_STATE.getModelState()
+    const workflowProviderName = modelState.getWorkflowProvider()
+    const agentProviderName = modelState.getAgentProvider()
+
     if (
+      workflowProviderName &&
       LOCAL_SERVER_PROVIDERS.has(workflowProviderName) &&
       this.workflowLLMProvider?.modelName
     ) {
@@ -148,6 +155,7 @@ export default class LLMProvider {
     }
 
     if (
+      agentProviderName &&
       LOCAL_SERVER_PROVIDERS.has(agentProviderName) &&
       this.agentLLMProvider?.modelName
     ) {
@@ -221,6 +229,8 @@ export default class LLMProvider {
       this.disposeCurrentProviders()
       this.workflowLLMProvider = undefined
       this.agentLLMProvider = undefined
+      this.workflowLLMProviderTargetLabel = null
+      this.agentLLMProviderTargetLabel = null
 
       LogHelper.title('LLM Provider')
       LogHelper.warning(
@@ -230,10 +240,11 @@ export default class LLMProvider {
       return false
     }
 
-    const configuredProviders = new Set<LLMProviders>([
-      ...(workflowTarget.isEnabled ? [workflowTarget.provider] : []),
-      ...(agentTarget.isEnabled ? [agentTarget.provider] : [])
-    ])
+    const configuredProviders = new Set<LLMProviders>(
+      [workflowTarget, agentTarget]
+        .filter((target) => target.isEnabled && target.provider)
+        .map((target) => target.provider as LLMProviders)
+    )
 
     for (const providerName of configuredProviders) {
       if (!Object.values(LLMProviders).includes(providerName)) {
@@ -259,6 +270,12 @@ export default class LLMProvider {
       : agentTarget.isEnabled
         ? await this.createProvider(agentTarget)
         : undefined
+    this.workflowLLMProviderTargetLabel = workflowTarget.isEnabled
+      ? workflowTarget.label
+      : null
+    this.agentLLMProviderTargetLabel = agentTarget.isEnabled
+      ? agentTarget.label
+      : null
 
     try {
       await this.bootLocalServerProviders()
@@ -290,10 +307,17 @@ export default class LLMProvider {
     this.disposeCurrentProviders()
     this.workflowLLMProvider = undefined
     this.agentLLMProvider = undefined
+    this.workflowLLMProviderTargetLabel = null
+    this.agentLLMProviderTargetLabel = null
   }
 
   private async createProvider(target: ResolvedLLMTarget): Promise<Provider> {
     const providerName = target.provider
+
+    if (!providerName) {
+      throw new Error('Cannot create an LLM provider for a disabled target.')
+    }
+
     const providerFileName =
       LLM_PROVIDERS_MAP[providerName as keyof typeof LLM_PROVIDERS_MAP]
 
@@ -318,12 +342,15 @@ export default class LLMProvider {
   private disposeCurrentProviders(): void {
     const providers = new Set([
       this.workflowLLMProvider as { dispose?: () => void } | undefined,
-      this.agentLLMProvider as { dispose?: () => void } | undefined
+      this.agentLLMProvider as { dispose?: () => void } | undefined,
+      ...this.sessionLLMProviders.values()
     ])
 
     for (const provider of providers) {
       provider?.dispose?.()
     }
+
+    this.sessionLLMProviders.clear()
   }
 
   private async bootLocalServerProviders(): Promise<void> {
@@ -339,10 +366,15 @@ export default class LLMProvider {
 
   private getProviderNameForDuty(dutyType: LLMDuties | null): LLMProviders {
     const modelState = CONFIG_STATE.getModelState()
-
-    return dutyType === LLMDuties.ReAct
+    const providerName = dutyType === LLMDuties.ReAct
       ? modelState.getAgentProvider()
       : modelState.getWorkflowProvider()
+
+    if (!providerName) {
+      throw new Error(LLM_PROVIDER_NOT_READY_MESSAGE)
+    }
+
+    return providerName
   }
 
   private getTargetForDuty(dutyType: LLMDuties | null): ResolvedLLMTarget {
@@ -357,6 +389,47 @@ export default class LLMProvider {
     return dutyType === LLMDuties.ReAct
       ? this.agentLLMProvider
       : this.workflowLLMProvider
+  }
+
+  private getProviderTargetLabelForDuty(dutyType: LLMDuties | null): string | null {
+    return dutyType === LLMDuties.ReAct
+      ? this.agentLLMProviderTargetLabel
+      : this.workflowLLMProviderTargetLabel
+  }
+
+  private getSessionProviderCacheKey(
+    dutyType: LLMDuties | null,
+    target: ResolvedLLMTarget
+  ): string {
+    return `${dutyType || 'workflow'}:${target.label}`
+  }
+
+  private async resolveProviderForDuty(
+    dutyType: LLMDuties | null
+  ): Promise<Provider | undefined> {
+    const target = this.getTargetForDuty(dutyType)
+
+    if (this.getProviderTargetLabelForDuty(dutyType) === target.label) {
+      return this.getProviderForDuty(dutyType)
+    }
+
+    if (!target.isEnabled || !target.isResolved) {
+      return undefined
+    }
+
+    const cacheKey = this.getSessionProviderCacheKey(dutyType, target)
+    const cachedProvider = this.sessionLLMProviders.get(cacheKey)
+
+    if (cachedProvider) {
+      return cachedProvider
+    }
+
+    const provider = await this.createProvider(target)
+
+    await provider.boot?.()
+    this.sessionLLMProviders.set(cacheKey, provider)
+
+    return provider
   }
 
   private getUnavailableProviderMessage(target: ResolvedLLMTarget): string {
@@ -382,8 +455,12 @@ export default class LLMProvider {
     workflowTarget: ResolvedLLMTarget,
     agentTarget: ResolvedLLMTarget
   ): boolean {
-    const workflowIsLocal = LOCAL_SERVER_PROVIDERS.has(workflowTarget.provider)
-    const agentIsLocal = LOCAL_SERVER_PROVIDERS.has(agentTarget.provider)
+    const workflowIsLocal = workflowTarget.provider
+      ? LOCAL_SERVER_PROVIDERS.has(workflowTarget.provider)
+      : false
+    const agentIsLocal = agentTarget.provider
+      ? LOCAL_SERVER_PROVIDERS.has(agentTarget.provider)
+      : false
 
     if (!workflowIsLocal || !agentIsLocal) {
       return false
@@ -854,6 +931,26 @@ export default class LLMProvider {
     }
 
     return this.truncateForLog(this.safeSerialize(details))
+  }
+
+  private formatPromptErrorForLog(error: unknown): string {
+    const errorObject =
+      error && typeof error === 'object'
+        ? (error as { message?: unknown, name?: unknown })
+        : null
+    const message =
+      typeof errorObject?.message === 'string'
+        ? errorObject.message
+        : String(error)
+    const name =
+      typeof errorObject?.name === 'string' ? errorObject.name : 'Error'
+
+    if (message && message !== '[object Object]') {
+      return `${name}: ${message}`
+    }
+
+    const details = this.buildProviderErrorDetails(error)
+    return details || String(error)
   }
 
   private isPromptAbortReason(value: unknown): value is LLMPromptAbortReason {
@@ -1970,13 +2067,15 @@ export default class LLMProvider {
   ): Promise<CompletionResult | null> {
     completionParams.dutyType = completionParams.dutyType ?? null
     const providerName = this.getProviderNameForDuty(completionParams.dutyType)
-    const provider = this.getProviderForDuty(completionParams.dutyType)
+    const provider = await this.resolveProviderForDuty(completionParams.dutyType)
     const trackProviderErrors = completionParams.trackProviderErrors !== false
     if (trackProviderErrors) {
       this.lastProviderErrorMessage = null
     }
 
-    const measureExecutionTimeLabel = `Inference time for "${completionParams.dutyType}" duty`
+    this.promptSequence += 1
+    const measureExecutionTimeLabel =
+      `Inference time for "${completionParams.dutyType}" duty #${this.promptSequence}`
 
     LogHelper.title('LLM Provider')
     LogHelper.info(`Using "${providerName}" provider for completion...`)
@@ -2059,6 +2158,7 @@ export default class LLMProvider {
 
     const abortController = new AbortController()
     let timeoutHandle: NodeJS.Timeout | null = null
+    let streamStallTimeoutHandle: NodeJS.Timeout | null = null
     let hasStartedStreaming = false
     const completionStartedAt = Date.now()
     let generationStartedAt: number | null = null
@@ -2069,6 +2169,31 @@ export default class LLMProvider {
     type OnTokenChunk = Parameters<
       NonNullable<CompletionParams['onToken']>
     >[0]
+    let rejectStreamStall: ((error: Error) => void) | null = null
+    const clearStreamStallTimeout = (): void => {
+      if (streamStallTimeoutHandle) {
+        clearTimeout(streamStallTimeoutHandle)
+        streamStallTimeoutHandle = null
+      }
+    }
+    const resetStreamStallTimeout = (): void => {
+      if (!shouldStreamOutput || !completionParams.timeout) {
+        return
+      }
+
+      clearStreamStallTimeout()
+      streamStallTimeoutHandle = setTimeout(() => {
+        if (!abortController.signal.aborted) {
+          abortController.abort()
+        }
+
+        rejectStreamStall?.(
+          new Error(
+            `Timeout (${completionParams.timeout}ms) for "${completionParams.dutyType}" duty after streaming stalled`
+          )
+        )
+      }, completionParams.timeout)
+    }
     const markStreamStarted = (): void => {
       if (!hasStartedStreaming) {
         hasStartedStreaming = true
@@ -2078,20 +2203,35 @@ export default class LLMProvider {
           timeoutHandle = null
           LogHelper.title('LLM Provider')
           LogHelper.debug(
-            'Streaming started; inference timeout watchdog disabled for this completion'
+            'Streaming started; inference timeout watchdog replaced by stream stall watchdog for this completion'
           )
         }
       }
     }
 
     const onTokenWithStreamStart = (chunk: OnTokenChunk): void => {
-      markStreamStarted()
+      if (typeof chunk === 'string' && chunk.length === 0) {
+        markStreamStarted()
+        resetStreamStallTimeout()
+        userOnToken?.(chunk)
+        return
+      }
 
+      markStreamStarted()
+      resetStreamStallTimeout()
       userOnToken?.(chunk)
     }
 
     const onReasoningTokenWithStreamStart = (reasoningChunk: string): void => {
+      if (reasoningChunk.length === 0) {
+        markStreamStarted()
+        resetStreamStallTimeout()
+        userOnReasoningToken?.(reasoningChunk)
+        return
+      }
+
       markStreamStarted()
+      resetStreamStallTimeout()
       userOnReasoningToken?.(reasoningChunk)
     }
 
@@ -2159,13 +2299,15 @@ export default class LLMProvider {
     } catch (e) {
       removeCallerAbortListener()
       LogHelper.title('LLM Provider')
-      LogHelper.error(`Error to complete prompt: ${String(e)}`)
+      LogHelper.error(
+        `Error to complete prompt: ${this.formatPromptErrorForLog(e)}`
+      )
       LogHelper.timeEnd(measureExecutionTimeLabel)
 
       if (trackProviderErrors) {
         this.lastProviderErrorMessage = this.buildProviderErrorMessage(
           providerName,
-          String(e),
+          this.formatPromptErrorForLog(e),
           this.buildProviderErrorDetails(e),
           isRemoteProvider
         )
@@ -2191,6 +2333,9 @@ export default class LLMProvider {
         )
       }, completionParams.timeout)
     })
+    const streamStallTimeoutPromise = new Promise((_, reject) => {
+      rejectStreamStall = reject
+    })
 
     let rawResult
     let rawResultString
@@ -2199,19 +2344,25 @@ export default class LLMProvider {
       rawResult = await Promise.race([
         rawResultPromise,
         timeoutPromise,
+        streamStallTimeoutPromise,
         callerAbortPromise
       ])
       if (timeoutHandle) {
         clearTimeout(timeoutHandle)
       }
+      clearStreamStallTimeout()
     } catch (e) {
       removeCallerAbortListener()
       if (timeoutHandle) {
         clearTimeout(timeoutHandle)
       }
+      clearStreamStallTimeout()
+      rejectStreamStall = null
 
       LogHelper.title('LLM Provider')
-      LogHelper.error(`Error to complete prompt: ${String(e)}`)
+      LogHelper.error(
+        `Error to complete prompt: ${this.formatPromptErrorForLog(e)}`
+      )
       LogHelper.timeEnd(measureExecutionTimeLabel)
 
       const isTimeoutError = this.isTimeoutLikeError(e)
@@ -2346,8 +2497,10 @@ export default class LLMProvider {
         this.lastProviderErrorMessage = this.buildProviderErrorMessage(
           providerName,
           statusLike !== undefined
-            ? `${String(e)} (statusCode=${String(statusLike)})`
-            : String(e),
+            ? `${this.formatPromptErrorForLog(e)} (statusCode=${String(
+                statusLike
+              )})`
+            : this.formatPromptErrorForLog(e),
           apiErrorDetails,
           isRemoteProvider
         )
@@ -2426,11 +2579,16 @@ export default class LLMProvider {
             : ({
                 data: remoteStreamCandidate
               } as AxiosResponse)
-        const normalized = await this.normalizeStreamingCompletionResult(
-          streamResponse,
-          completionParams,
-          providerName
-        )
+        resetStreamStallTimeout()
+        const normalized = (await Promise.race([
+          this.normalizeStreamingCompletionResult(
+            streamResponse,
+            completionParams,
+            providerName
+          ),
+          streamStallTimeoutPromise,
+          callerAbortPromise
+        ])) as NormalizedCompletionResult
 
         rawResult = normalized.rawResult
         usedInputTokens = normalized.usedInputTokens
@@ -2535,12 +2693,16 @@ export default class LLMProvider {
         }
       }
     } catch (e) {
+      clearStreamStallTimeout()
+      rejectStreamStall = null
       LogHelper.title('LLM Provider')
       LogHelper.error(`Failed to normalize completion result: ${String(e)}`)
       LogHelper.timeEnd(measureExecutionTimeLabel)
 
       return null
     }
+    clearStreamStallTimeout()
+    rejectStreamStall = null
 
     // Guard against silent empty provider responses which otherwise trigger
     // an unnecessary planning fallback and double latency.

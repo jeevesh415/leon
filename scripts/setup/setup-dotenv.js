@@ -1,9 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { PROFILE_DOT_ENV_PATH } from '@/constants'
+
 import { createSetupStatus } from './setup-status'
 
-const DOT_ENV_PATH = path.join(process.cwd(), '.env')
+const DOT_ENV_PATH = PROFILE_DOT_ENV_PATH
 const DOT_ENV_SAMPLE_PATH = path.join(process.cwd(), '.env.sample')
 const ENV_LINE_SEPARATOR_PATTERN = /\r?\n/
 
@@ -62,30 +64,6 @@ async function mergeMissingEnvVariables() {
 }
 
 /**
- * Read selected variables from `.env` without mutating process.env.
- */
-export async function readDotEnvVariables(variableNames) {
-  if (!fs.existsSync(DOT_ENV_PATH)) {
-    return {}
-  }
-
-  const dotEnvContent = await fs.promises.readFile(DOT_ENV_PATH, 'utf8')
-  const values = {}
-
-  for (const line of splitEnvLines(dotEnvContent)) {
-    const variableName = getEnvVariableName(line)
-
-    if (!variableName || !variableNames.includes(variableName)) {
-      continue
-    }
-
-    values[variableName] = line.slice(line.indexOf('=') + 1).replace(/\r$/, '')
-  }
-
-  return values
-}
-
-/**
  * Upsert a single variable inside `.env`.
  */
 export async function updateDotEnvVariable(variableName, value) {
@@ -114,6 +92,8 @@ export async function updateDotEnvVariable(variableName, value) {
     (line, index, lines) => !(index === lines.length - 1 && line === '')
   )
 
+  await fs.promises.mkdir(path.dirname(DOT_ENV_PATH), { recursive: true })
+
   await fs.promises.writeFile(
     DOT_ENV_PATH,
     `${normalizedLines.join('\n')}\n`
@@ -127,6 +107,7 @@ export default async () => {
   const status = createSetupStatus('Preparing .env...').start()
 
   if (!fs.existsSync(DOT_ENV_PATH)) {
+    await fs.promises.mkdir(path.dirname(DOT_ENV_PATH), { recursive: true })
     await fs.promises.copyFile(DOT_ENV_SAMPLE_PATH, DOT_ENV_PATH)
     status.succeed('.env: created')
 

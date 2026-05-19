@@ -2,8 +2,27 @@ import json
 import os
 from typing import Dict, Any, Optional
 
-from ..constants import TOOLKITS_PATH
+from ..constants import PROFILE_TOOLS_PATH, TOOLS_PATH
 from .utils import get_platform_name
+
+
+def merge_missing_settings(
+    default_settings: Dict[str, Any], existing_settings: Dict[str, Any]
+) -> Dict[str, Any]:
+    merged_settings = {**existing_settings}
+
+    for key, default_value in default_settings.items():
+        if key not in existing_settings:
+            merged_settings[key] = default_value
+            continue
+
+        existing_value = existing_settings[key]
+        if isinstance(default_value, dict) and isinstance(existing_value, dict):
+            merged_settings[key] = merge_missing_settings(
+                default_value, existing_value
+            )
+
+    return merged_settings
 
 
 class ToolkitConfig:
@@ -15,7 +34,7 @@ class ToolkitConfig:
     @classmethod
     def load(cls, toolkit_name: str, tool_name: str) -> Dict[str, Any]:
         """
-        Load tool configuration from bridges/toolkits directory
+        Load tool configuration from the flat tools structure.
 
         Args:
             toolkit_name: The toolkit name (e.g., 'video_streaming')
@@ -25,7 +44,7 @@ class ToolkitConfig:
 
         # Load toolkit config if not cached
         if cache_key not in cls._config_cache:
-            config_path = os.path.join(TOOLKITS_PATH, toolkit_name, "toolkit.json")
+            config_path = os.path.join(TOOLS_PATH, toolkit_name, "toolkit.json")
 
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
@@ -40,13 +59,8 @@ class ToolkitConfig:
         toolkit_config = cls._config_cache[cache_key]
         tools_list = toolkit_config.get("tools", [])
 
-        tool_config_path = os.path.join(
-            TOOLKITS_PATH, toolkit_name, "tools", f"{tool_name}.tool.json"
-        )
+        tool_config_path = os.path.join(TOOLS_PATH, toolkit_name, tool_name, "tool.json")
 
-        # toolkit.json remains the discovery surface for agent/runtime registry
-        # flows, but direct skill-side tool usage should still work when the
-        # tool manifest exists.
         if tool_name not in tools_list and not os.path.exists(tool_config_path):
             toolkit_name_display = toolkit_config.get("name", "unknown")
             raise Exception(
@@ -82,9 +96,24 @@ class ToolkitConfig:
         if cache_key in cls._settings_cache:
             return cls._settings_cache[cache_key]
 
-        settings_dir = os.path.join(TOOLKITS_PATH, toolkit_name, "settings")
-        settings_path = os.path.join(settings_dir, f"{tool_name}.settings.json")
+        settings_path = os.path.join(
+            PROFILE_TOOLS_PATH, toolkit_name, tool_name, "settings.json"
+        )
+        settings_sample_path = os.path.join(
+            TOOLS_PATH, toolkit_name, tool_name, "settings.sample.json"
+        )
+        settings_dir = os.path.dirname(settings_path)
         os.makedirs(settings_dir, exist_ok=True)
+        default_settings = defaults or {}
+
+        if os.path.exists(settings_sample_path):
+            try:
+                with open(settings_sample_path, "r", encoding="utf-8") as f:
+                    default_settings = json.load(f)
+            except json.JSONDecodeError as e:
+                raise Exception(
+                    f"Failed to load tool settings sample from '{settings_sample_path}': {str(e)}"
+                )
 
         tool_settings: Dict[str, Any] = {}
         should_write = False
@@ -100,14 +129,10 @@ class ToolkitConfig:
         else:
             should_write = True
 
-        defaults = defaults or {}
-        merged_settings = {**defaults, **tool_settings}
+        merged_settings = merge_missing_settings(default_settings, tool_settings)
 
         if not should_write:
-            for key in defaults.keys():
-                if key not in tool_settings:
-                    should_write = True
-                    break
+            should_write = tool_settings != merged_settings
 
         if should_write:
             with open(settings_path, "w", encoding="utf-8") as f:

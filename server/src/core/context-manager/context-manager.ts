@@ -6,9 +6,11 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
 import {
-  CONTEXT_PATH,
-  LEON_DISABLED_CONTEXT_FILES,
+  CODEBASE_CONTEXT_PATH,
+  CODEBASE_PATH,
+  LEON_CONTEXT_DISABLED_FILES,
   NODE_RUNTIME_BIN_PATH,
+  PROFILE_CONTEXT_PATH,
   TSX_CLI_PATH
 } from '@/constants'
 import { TOOLKIT_REGISTRY, LLM_PROVIDER } from '@/core'
@@ -29,7 +31,7 @@ const CONTEXT_FILES_RUNTIME_DIR = path.join(
   'context-files'
 )
 const CONTEXT_FILES_SOURCE_DIR = path.join(
-  process.cwd(),
+  CODEBASE_PATH,
   'server',
   'src',
   'core',
@@ -37,7 +39,7 @@ const CONTEXT_FILES_SOURCE_DIR = path.join(
   'context-files'
 )
 const CONTEXT_MANAGER_DIR = path.dirname(fileURLToPath(import.meta.url))
-const SOURCE_AWARE_STATIC_CONTEXT_FILES = new Set([
+const CODEBASE_CONTEXT_FILES = new Set([
   'LEON.md',
   'ARCHITECTURE.md'
 ])
@@ -64,6 +66,7 @@ const CONTEXT_REFRESH_WORKER_DIST_PATH = path.join(
   'context-refresh-worker.js'
 )
 const CONTEXT_REFRESH_WORKER_MAX_BUFFER = 1024 * 1024 * 8
+const DISABLE_ALL_CONTEXT_FILES_VALUE = '*'
 const RETIRED_CONTEXT_FILES = [
   'LOCAL_ECOSYSTEM.md',
   'NETWORK.md',
@@ -99,11 +102,15 @@ export default class ContextManager {
       getLocalLLMName: () => LLM_PROVIDER.localLLMName
     }
   )
-  private readonly disabledContextFiles = this.parseContextFileList(
-    LEON_DISABLED_CONTEXT_FILES
-  )
+  private readonly hasDisabledAllContextFiles =
+    this.hasDisableAllContextFilesValue(LEON_CONTEXT_DISABLED_FILES)
+  private readonly disabledContextFiles = this.hasDisabledAllContextFiles
+    ? new Set(this.allContextFiles.map((definition) => definition.filename))
+    : this.parseContextFileList(LEON_CONTEXT_DISABLED_FILES)
   private readonly contextFiles: ContextFile[] = this.allContextFiles.filter(
-    (definition) => !this.disabledContextFiles.has(definition.filename)
+    (definition) =>
+      !this.hasDisabledAllContextFiles &&
+      !this.disabledContextFiles.has(definition.filename)
   )
 
   public constructor() {
@@ -125,9 +132,11 @@ export default class ContextManager {
     }
 
     try {
-      await fs.promises.mkdir(CONTEXT_PATH, { recursive: true })
+      await fs.promises.mkdir(PROFILE_CONTEXT_PATH, { recursive: true })
+      await fs.promises.mkdir(CODEBASE_CONTEXT_PATH, { recursive: true })
       this.cleanupDisabledContextFiles()
       this.cleanupRetiredContextFiles()
+      this.cleanupProfileCopiesOfCodebaseContextFiles()
       this.refreshContextFilesAtBootInBackground()
 
       await this.syncContextReadFilenameEnum()
@@ -281,7 +290,15 @@ export default class ContextManager {
   }
 
   private getContextFilePath(filename: string): string {
-    return path.join(CONTEXT_PATH, filename)
+    if (CODEBASE_CONTEXT_FILES.has(filename)) {
+      return path.join(CODEBASE_CONTEXT_PATH, filename)
+    }
+
+    return path.join(PROFILE_CONTEXT_PATH, filename)
+  }
+
+  private getProfileContextFilePath(filename: string): string {
+    return path.join(PROFILE_CONTEXT_PATH, filename)
   }
 
   private normalizeFilename(filename: string): string {
@@ -322,7 +339,7 @@ export default class ContextManager {
       return true
     }
 
-    if (SOURCE_AWARE_STATIC_CONTEXT_FILES.has(definition.filename)) {
+    if (CODEBASE_CONTEXT_FILES.has(definition.filename)) {
       const sourceUpdatedAt = this.getContextSourceUpdatedAt(definition)
       if (
         typeof sourceUpdatedAt === 'number' &&
@@ -440,7 +457,7 @@ export default class ContextManager {
     return [
       TSX_CLI_PATH,
       '--tsconfig',
-      path.join(process.cwd(), 'tsconfig.json'),
+      path.join(CODEBASE_PATH, 'tsconfig.json'),
       CONTEXT_REFRESH_WORKER_SRC_PATH
     ]
   }
@@ -466,8 +483,9 @@ export default class ContextManager {
 
     try {
       const { stdout } = await execFileAsync(NODE_RUNTIME_BIN_PATH, workerArgs, {
-        cwd: process.cwd(),
-        maxBuffer: CONTEXT_REFRESH_WORKER_MAX_BUFFER
+        cwd: CODEBASE_PATH,
+        maxBuffer: CONTEXT_REFRESH_WORKER_MAX_BUFFER,
+        windowsHide: true
       })
       const parsed = JSON.parse(String(stdout || '{}')) as {
         success?: boolean
@@ -481,7 +499,7 @@ export default class ContextManager {
 
       const filePath = this.getContextFilePath(definition.filename)
       const content = this.ensureTrailingNewline(parsed.content)
-      fs.mkdirSync(CONTEXT_PATH, { recursive: true })
+      fs.mkdirSync(path.dirname(filePath), { recursive: true })
       fs.writeFileSync(filePath, content, 'utf-8')
       this.metadata.set(definition.filename, {
         lastGeneratedAt: Date.now()
@@ -649,7 +667,7 @@ export default class ContextManager {
     try {
       const content = this.ensureTrailingNewline(definition.generate())
 
-      fs.mkdirSync(CONTEXT_PATH, { recursive: true })
+      fs.mkdirSync(path.dirname(filePath), { recursive: true })
       fs.writeFileSync(filePath, content, 'utf-8')
       this.metadata.set(definition.filename, {
         lastGeneratedAt: Date.now()
@@ -723,19 +741,42 @@ export default class ContextManager {
     }
   }
 
-  private parseContextFileList(rawFileList: string): Set<string> {
+  private parseContextFileList(rawFileList: string[]): Set<string> {
     return new Set(
       rawFileList
-        .split(/[,;\n]/)
         .map((value) => this.normalizeFilename(value))
         .filter((value) => value.length > 0)
     )
   }
 
+  private hasDisableAllContextFilesValue(rawFileList: string[]): boolean {
+    return rawFileList.some(
+      (value) => value.trim() === DISABLE_ALL_CONTEXT_FILES_VALUE
+    )
+  }
+
   private cleanupDisabledContextFiles(): void {
     for (const filename of this.disabledContextFiles) {
-      const filePath = this.getContextFilePath(filename)
+      const filePath = CODEBASE_CONTEXT_FILES.has(filename)
+        ? this.getProfileContextFilePath(filename)
+        : this.getContextFilePath(filename)
       this.metadata.delete(filename)
+
+      if (!fs.existsSync(filePath)) {
+        continue
+      }
+
+      try {
+        fs.rmSync(filePath, { force: true })
+      } catch {
+        continue
+      }
+    }
+  }
+
+  private cleanupProfileCopiesOfCodebaseContextFiles(): void {
+    for (const filename of CODEBASE_CONTEXT_FILES) {
+      const filePath = this.getProfileContextFilePath(filename)
 
       if (!fs.existsSync(filePath)) {
         continue

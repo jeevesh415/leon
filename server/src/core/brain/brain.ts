@@ -8,10 +8,11 @@ import type { NLUProcessResult } from '@/core/nlp/types'
 import type { SkillAnswerConfigSchema } from '@/schemas/skill-schemas'
 import type { BrainProcessResult } from '@/core/brain/types'
 import { SkillActionTypes } from '@/core/brain/types'
-import { HAS_TTS } from '@/constants'
+import { GLOBAL_DATA_PATH, HAS_TTS } from '@/constants'
 import {
   CONVERSATION_LOGGER,
   NLU,
+  POST_TURN_MAINTENANCE_QUEUE,
   SELF_MODEL_MANAGER,
   SOCKET_SERVER,
   TTS
@@ -22,6 +23,7 @@ import { ParaphraseLLMDuty } from '@/core/llm-manager/llm-duties/paraphrase-llm-
 import { AnswerQueue } from '@/core/brain/answer-queue'
 import { LogicActionSkillHandler } from '@/core/brain/logic-action-skill-handler'
 import { DialogActionSkillHandler } from '@/core/brain/dialog-action-skill-handler'
+import { CONVERSATION_SESSION_MANAGER } from '@/core/session-manager'
 
 type SkillProcess = ChildProcessWithoutNullStreams | undefined
 interface IsTalkingWithVoiceOptions {
@@ -56,7 +58,7 @@ export default class Brain {
   private answerQueueProcessTimerId: NodeJS.Timeout | undefined = undefined
   private broca: GlobalAnswersSchema = JSON.parse(
     fs.readFileSync(
-      path.join(process.cwd(), 'core', 'data', this._lang, 'answers.json'),
+      path.join(GLOBAL_DATA_PATH, this._lang, 'answers.json'),
       'utf8'
     )
   )
@@ -150,7 +152,7 @@ export default class Brain {
     // Update broca
     this.broca = JSON.parse(
       fs.readFileSync(
-        path.join(process.cwd(), 'core', 'data', this._lang, 'answers.json'),
+        path.join(GLOBAL_DATA_PATH, this._lang, 'answers.json'),
         'utf8'
       )
     )
@@ -302,6 +304,7 @@ export default class Brain {
          * It may happen that only a speech is needed
          */
         if (textAnswer) {
+          const finalTextAnswer = textAnswer
           const recentConversationLogs = await CONVERSATION_LOGGER.load({
             nbOfLogsToLoad: 12
           })
@@ -316,31 +319,38 @@ export default class Brain {
           SOCKET_SERVER.emitAnswerToChatClients(
             llmMetrics
               ? {
-                  answer: textAnswer,
+                  answer: finalTextAnswer,
                   llmMetrics
                 }
-              : textAnswer
+              : finalTextAnswer
           )
 
           if (NLU.currentResponseRoute !== 'react') {
-            void SELF_MODEL_MANAGER.observeTurn({
-              userMessage: ownerMessage,
-              assistantMessage: textAnswer,
-              sentAt,
-              route: 'workflow',
-              finalIntent: 'answer'
-            }).catch((error: unknown) => {
-              LogHelper.title('Brain')
-              LogHelper.warning(`Failed to update workflow self model: ${error}`)
-            })
+            POST_TURN_MAINTENANCE_QUEUE.enqueue(
+              'controlled self-model reflection',
+              () => SELF_MODEL_MANAGER.observeTurn({
+                userMessage: ownerMessage,
+                assistantMessage: finalTextAnswer,
+                sentAt,
+                route: 'controlled',
+                finalIntent: 'answer'
+              })
+            )
           }
 
           await CONVERSATION_LOGGER.push({
             who: 'leon',
-            message: textAnswer,
+            message: finalTextAnswer,
             isAddedToHistory: true,
             ...(llmMetrics ? { llmMetrics } : {})
           })
+          POST_TURN_MAINTENANCE_QUEUE.enqueue(
+            'session title generation',
+            () => CONVERSATION_SESSION_MANAGER.generateTitleFromFirstMessage(
+              CONVERSATION_SESSION_MANAGER.getCurrentSessionId(),
+              ownerMessage
+            )
+          )
         }
 
         // SOCKET_SERVER.socket?.emit('is-typing', false)
@@ -388,19 +398,10 @@ export default class Brain {
     }
 
     this.answerQueue.push(answer)
-    /**
-     * If the answer queue is not processing and not empty,
-     * then process the queue,
-     * otherwise clean up the new answer queue timer right away to not have multiple timers running
-     */
-    const answerTimerCheckerId = setInterval(() => {
-      if (!this.answerQueue.isProcessing && !this.answerQueue.isEmpty()) {
-        this.processAnswerQueue(end)
-      } else {
-        this.cleanUpAnswerQueueTimer(answerTimerCheckerId)
-      }
-    }, 300)
-    this.answerQueueProcessTimerId = answerTimerCheckerId
+
+    if (!this.answerQueue.isProcessing && !this.answerQueue.isEmpty()) {
+      await this.processAnswerQueue(end)
+    }
   }
 
   /**

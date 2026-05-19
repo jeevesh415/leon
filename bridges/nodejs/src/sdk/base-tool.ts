@@ -10,9 +10,10 @@ import {
 } from '@/helpers/network-helper'
 
 import {
+  LEON_TOOLKITS_PATH,
   NVIDIA_LIBS_PATH,
-  PYTORCH_TORCH_PATH,
-  TOOLKITS_PATH
+  PROFILE_TOOLS_PATH,
+  PYTORCH_TORCH_PATH
 } from '@bridge/constants'
 import { ToolkitConfig } from '@sdk/toolkit-config'
 import { reportToolOutput } from '@sdk/tool-reporter'
@@ -26,6 +27,9 @@ import {
   formatFilePath,
   extractArchive
 } from '@sdk/utils'
+
+const COMMAND_OUTPUT_PROGRESS_INTERVAL_MS = 2_000
+const COMMAND_OUTPUT_MAX_CHARS = 4_000
 
 // Progress callback type for reporting tool progress
 export type ProgressCallback = (progress: {
@@ -128,11 +132,12 @@ export abstract class Tool {
    */
   protected getSettingsPath(toolName?: string): string {
     const resolvedToolName = toolName || this.toolName
+
     return path.join(
-      TOOLKITS_PATH,
+      PROFILE_TOOLS_PATH,
       this.toolkit,
-      'settings',
-      `${resolvedToolName}.settings.json`
+      resolvedToolName,
+      'settings.json'
     )
   }
 
@@ -209,19 +214,9 @@ export abstract class Tool {
   }
 
   /**
-   * Escape shell argument by escaping special characters with backslashes
-   * This follows the Unix/Linux shell escaping convention
+   * Escape a shell argument.
    */
   private escapeShellArg(arg: string): string {
-    // Don't escape URLs - they have their own structure
-    try {
-      new URL(arg)
-      // If URL constructor succeeds, it's a valid URL - don't escape it
-      return arg
-    } catch {
-      // Not a valid URL, continue with normal escaping
-    }
-
     if (isWindows()) {
       // Windows: wrap in double quotes and escape internal quotes
       if (
@@ -236,8 +231,7 @@ export abstract class Tool {
       return arg
     }
 
-    // Unix/Linux: escape special characters with backslashes
-    return arg.replace(/(["\s'$`\\(){}[\]|&;<>*?!])/g, '\\$1')
+    return `'${arg.replace(/'/g, `'\\''`)}'`
   }
 
   /**
@@ -383,17 +377,59 @@ export abstract class Tool {
     return new Promise((resolve, reject) => {
       const startTime = Date.now()
       let outputBuffer = ''
+      let pendingOutput = ''
+      let outputFlushTimer: NodeJS.Timeout | null = null
+      let timeoutHandle: NodeJS.Timeout | null = null
       const env = this.getBundledLibraryEnv()
+      const flushOutputDelta = async (): Promise<void> => {
+        if (!pendingOutput) {
+          return
+        }
+
+        const output = pendingOutput
+        pendingOutput = ''
+        await this.reportCommandOutputDelta(output, commandString, toolGroupId)
+      }
+      const scheduleOutputDelta = (output: string): void => {
+        pendingOutput += output
+
+        if (outputFlushTimer) {
+          return
+        }
+
+        outputFlushTimer = setTimeout(() => {
+          outputFlushTimer = null
+          void flushOutputDelta()
+        }, COMMAND_OUTPUT_PROGRESS_INTERVAL_MS)
+      }
+      const clearOutputFlushTimer = (): void => {
+        if (!outputFlushTimer) {
+          return
+        }
+
+        clearTimeout(outputFlushTimer)
+        outputFlushTimer = null
+      }
+      const clearCommandTimeout = (): void => {
+        if (!timeoutHandle) {
+          return
+        }
+
+        clearTimeout(timeoutHandle)
+        timeoutHandle = null
+      }
 
       const childProcess = spawn(binaryPath, args, {
         cwd: execOptions.cwd,
-        env
+        env,
+        windowsHide: true
       })
 
       // Handle stdout
       childProcess.stdout.on('data', (data) => {
         const output = data.toString()
         outputBuffer += output
+        scheduleOutputDelta(output)
 
         if (onOutput) {
           onOutput(output, false)
@@ -409,6 +445,7 @@ export abstract class Tool {
       childProcess.stderr.on('data', (data) => {
         const output = data.toString()
         outputBuffer += output
+        scheduleOutputDelta(output)
 
         if (onOutput) {
           onOutput(output, true)
@@ -418,6 +455,9 @@ export abstract class Tool {
       // Handle process completion
       childProcess.on('close', async (code) => {
         const executionTime = Date.now() - startTime
+        clearCommandTimeout()
+        clearOutputFlushTimer()
+        await flushOutputDelta()
 
         if (code === 0) {
           await this.report(
@@ -455,14 +495,25 @@ export abstract class Tool {
             commandString,
             toolGroupId
           )
-          reject(
-            new Error(`Command failed with exit code ${code}: ${outputBuffer}`)
-          )
+          const commandError = new Error(
+            `Command failed with exit code ${code}: ${outputBuffer}`
+          ) as Error & {
+            stdout?: string
+            stderr?: string
+            status?: number | null
+          }
+          commandError.stdout = outputBuffer
+          commandError.stderr = ''
+          commandError.status = code
+          reject(commandError)
         }
       })
 
       // Handle process errors
       childProcess.on('error', async (error) => {
+        clearCommandTimeout()
+        clearOutputFlushTimer()
+        await flushOutputDelta()
         await this.report(
           'bridges.tools.command_error',
           {
@@ -476,7 +527,10 @@ export abstract class Tool {
 
       // Handle timeout
       if (execOptions.timeout) {
-        setTimeout(() => {
+        timeoutHandle = setTimeout(() => {
+          timeoutHandle = null
+          clearOutputFlushTimer()
+          void flushOutputDelta()
           childProcess.kill('SIGTERM')
           this.report(
             'bridges.tools.command_timeout',
@@ -571,7 +625,7 @@ export abstract class Tool {
         ? `${actualFilename}.exe`
         : actualFilename
 
-    const binsPath = path.join(TOOLKITS_PATH, this.toolkit, 'bins')
+    const binsPath = path.join(LEON_TOOLKITS_PATH, this.toolkit, 'assets')
 
     // Ensure toolkit bins directory exists
     if (!fs.existsSync(binsPath)) {
@@ -606,18 +660,22 @@ export abstract class Tool {
     return binaryPath
   }
 
-  private formatCommandOutput(output: string): string | null {
+  private formatCommandOutput(
+    output: string,
+    options: { preserveWhitespace?: boolean } = {}
+  ): string | null {
     const trimmed = output.trim()
     if (!trimmed) {
       return null
     }
 
-    const maxLength = 4000
-    if (trimmed.length <= maxLength) {
-      return trimmed
+    const value = options.preserveWhitespace ? output : trimmed
+    const maxLength = COMMAND_OUTPUT_MAX_CHARS
+    if (value.length <= maxLength) {
+      return value
     }
 
-    return `${trimmed.slice(0, maxLength)}\n... (truncated)`
+    return `${value.slice(0, maxLength)}\n... (truncated)`
   }
 
   private async reportCommandOutput(
@@ -632,6 +690,28 @@ export abstract class Tool {
 
     await this.report(
       'bridges.tools.command_output',
+      {
+        command,
+        output: formatted
+      },
+      toolGroupId
+    )
+  }
+
+  private async reportCommandOutputDelta(
+    output: string,
+    command: string,
+    toolGroupId: string
+  ): Promise<void> {
+    const formatted = this.formatCommandOutput(output, {
+      preserveWhitespace: true
+    })
+    if (!formatted) {
+      return
+    }
+
+    await this.report(
+      'bridges.tools.command_output_delta',
       {
         command,
         output: formatted
@@ -667,9 +747,7 @@ export abstract class Tool {
     }
 
     const resourcePath = path.join(
-      TOOLKITS_PATH,
-      this.toolkit,
-      'bins',
+      path.join(LEON_TOOLKITS_PATH, this.toolkit, 'assets'),
       resourceName
     )
 
@@ -1036,7 +1114,11 @@ export abstract class Tool {
   }
 
   private spawnDetached(command: string, args: string[]): void {
-    const child = spawn(command, args, { detached: true, stdio: 'ignore' })
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true
+    })
     child.unref()
   }
 
@@ -1063,7 +1145,7 @@ export abstract class Tool {
     executable: string
   ): Promise<void> {
     try {
-      const binsPath = path.join(TOOLKITS_PATH, this.toolkit, 'bins')
+      const binsPath = path.join(LEON_TOOLKITS_PATH, this.toolkit, 'assets')
       const binaryPath = path.join(binsPath, executable)
 
       await this.report('bridges.tools.binary_not_found', {
@@ -1213,7 +1295,8 @@ export abstract class Tool {
         fs.rmSync(tempExtractPath, { recursive: true, force: true })
 
         await this.report('bridges.tools.archive_extracted', {
-          binary_name: path.basename(outputPath)
+          binary_name: path.basename(outputPath),
+          binary_path: outputPath
         })
       }
     } catch (error) {
@@ -1277,34 +1360,44 @@ export abstract class Tool {
       const eta =
         progress.etaMs !== null ? formatETA(progress.etaMs / 1_000) : ''
 
-      let progressLine = `Downloading ${fileName}`
-
-      if (progress.percentage !== null) {
-        progressLine += `: ${percentage}%`
+      const progressData: Record<string, string | number> = {
+        file_name: fileName,
+        percentage: percentage,
+        speed: '',
+        eta: '',
+        downloaded_size: '',
+        total_size: ''
       }
-
       if (speed) {
-        progressLine += ` at ${speed}`
+        progressData['speed'] = speed
       }
-
       if (eta && eta !== '∞') {
-        progressLine += ` (ETA: ${eta})`
+        progressData['eta'] = eta
       }
-
       if (
         progress.totalBytes !== null &&
         progress.downloadedBytes <= progress.totalBytes
       ) {
-        progressLine += ` [${formatBytes(progress.downloadedBytes)}/${formatBytes(progress.totalBytes)}]`
+        progressData['downloaded_size'] = formatBytes(progress.downloadedBytes)
+        progressData['total_size'] = formatBytes(progress.totalBytes)
       }
 
-      this.log(progressLine)
+      const progressKey =
+        progressData['speed'] &&
+        progressData['eta'] &&
+        progressData['downloaded_size'] &&
+        progressData['total_size']
+          ? 'bridges.tools.download_progress_with_details'
+          : 'bridges.tools.download_progress'
+      void this.report(progressKey, progressData)
 
       if (
         progress.totalBytes !== null &&
         progress.downloadedBytes === progress.totalBytes
       ) {
-        this.log(`Download completed: ${fileName}`)
+        void this.report('bridges.tools.download_completed', {
+          file_name: fileName
+        })
       }
 
       lastLoggedPercentage = percentage

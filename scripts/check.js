@@ -38,14 +38,17 @@ import {
   PYTHON_TCP_SERVER_TTS_BERT_BASE_DIR_PATH,
   PYTHON_TCP_SERVER_ASR_MODEL_DIR_PATH,
   AUDIO_MODELS_PATH,
+  PROFILE_DOT_ENV_PATH,
   TSX_CLI_PATH,
   LANG,
   HAS_STT,
   HAS_TTS,
+  HAS_WAKE_WORD,
   SHOULD_START_PYTHON_TCP_SERVER,
   LEON_ROUTING_MODE,
   WORKFLOW_LLM_TARGET,
   AGENT_LLM_TARGET,
+  NATIVE_SKILLS_PATH,
   PYTORCH_TORCH_PATH,
   NVIDIA_CUBLAS_PATH,
   NVIDIA_CUDNN_PATH,
@@ -56,7 +59,7 @@ import {
   NVIDIA_NVSHMEM_PATH
 } from '@/constants'
 
-dotenv.config()
+dotenv.config({ path: PROFILE_DOT_ENV_PATH })
 
 const CHECK_TMP_DIR_PATH = path.join(process.cwd(), 'scripts', 'tmp')
 const PYTHON_TCP_SERVER_TTS_MODEL_CONFIG_PATH = path.join(
@@ -144,8 +147,7 @@ function buildExtraContext(lang) {
 
 async function createNodejsBridgeIntentObject() {
   const skillConfigPath = path.join(
-    process.cwd(),
-    'skills',
+    NATIVE_SKILLS_PATH,
     'date_time_skill',
     'skill.json'
   )
@@ -179,8 +181,7 @@ async function createNodejsBridgeIntentObject() {
 
 async function createPythonBridgeIntentObject() {
   const skillConfigPath = path.join(
-    process.cwd(),
-    'skills',
+    NATIVE_SKILLS_PATH,
     'color_skill',
     'skill.json'
   )
@@ -265,7 +266,8 @@ function startTCPServerCheck() {
   return new Promise((resolve) => {
     const child = spawn(PYTHON_TCP_SERVER_RUNTIME_BIN_PATH, args, {
       env,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
     })
 
     const timeoutMs = 3 * 60_000
@@ -410,7 +412,7 @@ function checkTCPServerAssets() {
     )
   }
 
-  if (process.env['LEON_WAKE_WORD'] === 'true') {
+  if (HAS_WAKE_WORD) {
     if (!fs.existsSync(PYTHON_TCP_SERVER_WAKE_WORD_MODEL_PATH)) {
       addFailure(
         result,
@@ -436,7 +438,7 @@ function checkTCPServerAssets() {
   if (result.ok) {
     addDetail(
       result,
-      `STT=${HAS_STT ? 'enabled' : 'disabled'}, TTS=${HAS_TTS ? 'enabled' : 'disabled'}, wake_word=${process.env['LEON_WAKE_WORD'] === 'true' ? 'enabled' : 'disabled'}`
+      `STT=${HAS_STT ? 'enabled' : 'disabled'}, TTS=${HAS_TTS ? 'enabled' : 'disabled'}, wake_word=${HAS_WAKE_WORD ? 'enabled' : 'disabled'}`
     )
   }
 

@@ -1,8 +1,15 @@
 import { LogHelper } from '@/helpers/log-helper'
 import { TOOLKIT_REGISTRY } from '@/core'
+import {
+  NODE_RUNTIME_BIN_PATH,
+  PNPM_RUNTIME_BIN_PATH,
+  PYTHON_RUNTIME_BIN_PATH,
+  UV_RUNTIME_BIN_PATH
+} from '@/constants'
 
 import { CHARS_PER_TOKEN, DUTY_NAME } from './constants'
 import type {
+  AgentSkillContext,
   ExecutionRecord,
   LLMCaller,
   PlanResult
@@ -96,7 +103,9 @@ export function extractFailureMessageFromObservation(observation: string): strin
     return message
   }
 
-  const toolOutputFailure = asRecord(parsed['tool_output_failure'])
+  const toolOutputFailure =
+    asRecord(parsed['observed_tool_failure']) ||
+    asRecord(parsed['tool_output_failure'])
   const failureError =
     toolOutputFailure && typeof toolOutputFailure['error'] === 'string'
       ? (toolOutputFailure['error'] as string).trim()
@@ -275,6 +284,50 @@ export function buildSelfModelSection(snapshot: string): string {
   return normalized
 }
 
+export function buildActiveAgentSkillSection(
+  agentSkillContext: AgentSkillContext | null | undefined
+): string {
+  if (!agentSkillContext) {
+    return ''
+  }
+
+  return [
+    '<active_agent_skill>',
+    `id: ${agentSkillContext.id}`,
+    `name: ${agentSkillContext.name}`,
+    `description: ${agentSkillContext.description}`,
+    `root_path: ${agentSkillContext.rootPath}`,
+    `skill_path: ${agentSkillContext.skillPath}`,
+    '',
+    '<leon_agent_skill_runtime>',
+    `node: ${NODE_RUNTIME_BIN_PATH}`,
+    `python: ${PYTHON_RUNTIME_BIN_PATH}`,
+    `pnpm: ${PNPM_RUNTIME_BIN_PATH}`,
+    `uv: ${UV_RUNTIME_BIN_PATH}`,
+    'When running local scripts for this active agent skill, prefer these managed binaries over bare node, python, pnpm, or uv commands.',
+    '</leon_agent_skill_runtime>',
+    '',
+    agentSkillContext.instructions,
+    '</active_agent_skill>',
+    '',
+    '<active_agent_skill_policy>',
+    'This Agent Skill is the selected execution scope for the current step. Follow its SKILL.md instructions for this step.',
+    'When the skill provides scripts or other resources that can perform the needed work, use those resources before any generic overlapping tool.',
+    'For script-backed Agent Skills, execute the relevant script through operating_system_control.shell.executeCommand from the skill root path.',
+    'Do not replace the selected Agent Skill with generic web, search, deep-research, or ad hoc scraping tools unless the skill script/resource was attempted and cannot satisfy the step.',
+    'If recovery is needed, recover by adjusting the selected Agent Skill script/resource usage first.',
+    '</active_agent_skill_policy>'
+  ].join('\n')
+}
+
+export function buildAgentSkillDiscoverySection(caller: LLMCaller): string {
+  return [
+    '<available_agent_skills>',
+    caller.agentSkillCatalog,
+    '</available_agent_skills>'
+  ].join('\n')
+}
+
 export function stripInlineToolMarkup(text: string): string {
   if (!text) {
     return ''
@@ -305,6 +358,27 @@ export function extractPlanningMarkedFinalAnswer(text: string): string | null {
 
   const answer = match[1]?.trim() || ''
   return answer || null
+}
+
+export function shouldTreatPlainPlanningTextAsFinalAnswer(text: string): boolean {
+  const sanitized = stripInlineToolMarkup(text)
+  if (!sanitized) {
+    return false
+  }
+
+  if (/^(\{|\[|```|<tool_call\b|<function=)/i.test(sanitized)) {
+    return false
+  }
+
+  if (/\b[a-z_]+\.[a-z_]+\.[a-zA-Z_]+\b/.test(sanitized)) {
+    return false
+  }
+
+  if (/\b(type|steps|summary|function|tool_call)\b\s*[:=]/i.test(sanitized)) {
+    return false
+  }
+
+  return true
 }
 
 export function extractPlanningTextHandoffDraft(text: string): string | null {

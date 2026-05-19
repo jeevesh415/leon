@@ -3,10 +3,14 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import { LogHelper } from '@/helpers/log-helper'
+import { RuntimeHelper } from '@/helpers/runtime-helper'
+import { SystemHelper } from '@/helpers/system-helper'
+import { LEON_HOME_PATH } from '@/leon-roots'
 import {
   TOOLKIT_REGISTRY,
   TOOL_EXECUTOR,
-  SOCKET_SERVER
+  SOCKET_SERVER,
+  BRAIN
 } from '@/core'
 import type { OpenAITool } from '@/core/llm-manager/types'
 
@@ -15,7 +19,8 @@ import {
   EXECUTE_SYSTEM_PROMPT,
   MAX_RETRIES_PER_FUNCTION,
   MAX_TOOL_FAILURE_RETRIES,
-  DUTY_NAME
+  DUTY_NAME,
+  READ_TOOL_ARTIFACT_FUNCTION
 } from './constants'
 import type {
   PlanStep,
@@ -26,8 +31,10 @@ import type {
   LLMCaller,
   FunctionConfig,
   PromptLogSection,
+  LLMCallOptions,
   FinalPhaseIntent,
-  FinalResponseSignal
+  FinalResponseSignal,
+  AgentSkillContext
 } from './types'
 import {
   isToolLevel,
@@ -47,11 +54,55 @@ import {
   buildPreviouslyUsedInputsSection,
   buildToolkitContextSection,
   buildContextManifestSection,
-  buildSelfModelSection
+  buildSelfModelSection,
+  buildActiveAgentSkillSection
 } from './phase-helpers'
 import {
   buildPhaseSystemPrompt
 } from './phase-policy'
+
+// Tool argument generation may still need execution reasoning to replan when
+// prerequisites are missing. Only disable provider streaming here, so timeouts
+// still protect tool calls if a stream opens but stalls before a final result.
+const TOOL_ARGUMENT_LLM_OPTIONS = {
+  phase: 'execution',
+  streamToProvider: false
+} satisfies LLMCallOptions
+
+const SHELL_HELP_OBSERVATION_MAX_CHARS = 8_000
+const SHELL_REPAIR_OBSERVATION_MAX_CHARS = 3_000
+const SHELL_REPAIR_MAX_TOKENS = 512
+const MAX_SHELL_REPAIR_ATTEMPTS = 1
+
+const SHELL_EXECUTE_FUNCTION = 'operating_system_control.shell.executeCommand'
+interface ShellCommandProbe {
+  executable: string
+}
+
+const TOOL_PREPARATION_STARTED_REPORT_KEYS = new Set([
+  'bridges.tools.creating_bins_directory',
+  'bridges.tools.binary_not_found',
+  'bridges.tools.downloading_from_url',
+  'bridges.tools.download_progress',
+  'bridges.tools.download_progress_with_details',
+  'bridges.tools.extracting_archive',
+  'bridges.tools.making_executable',
+  'bridges.tools.removing_quarantine',
+  'bridges.tools.creating_resource_directory',
+  'bridges.tools.downloading_resource',
+  'bridges.tools.downloading_resource_file'
+])
+const TOOL_PREPARATION_READY_REPORT_KEYS = new Set([
+  'bridges.tools.binary_ready',
+  'bridges.tools.resource_downloaded'
+])
+const TOOL_PREPARATION_FAILED_REPORT_KEYS = new Set([
+  'bridges.tools.no_binary_url',
+  'bridges.tools.no_resource_urls',
+  'bridges.tools.download_failed',
+  'bridges.tools.download_url_failed',
+  'bridges.tools.resource_file_download_failed'
+])
 
 async function buildExecutionMemorySection(
   _caller: LLMCaller,
@@ -62,6 +113,17 @@ async function buildExecutionMemorySection(
     `Execution memory injection disabled [${toolkitId}] (use structured_knowledge.memory.read when memory is needed)`
   )
   return 'Execution Memory: none'
+}
+
+async function buildPreviousToolArtifactsExecutionSection(
+  caller: LLMCaller
+): Promise<string> {
+  const previousToolArtifacts =
+    (await caller.getPreviousToolArtifacts?.())?.trim() || ''
+
+  return previousToolArtifacts
+    ? `\n\n<previous_tool_outputs>\nUse these exact outputLogPath values with ${READ_TOOL_ARTIFACT_FUNCTION} when a previous tool result is truncated or missing detail. Do not invent output file paths.\n${previousToolArtifacts}\n</previous_tool_outputs>`
+    : ''
 }
 
 function buildExecutionPromptSections(params: {
@@ -146,11 +208,385 @@ function createExecutionHandoff(
   }
 }
 
+function clipShellObservation(value: string, maxChars: number): string {
+  const normalized = value
+    .split('')
+    .reduce(
+      (state, char) => {
+        if (char === ' ' || char === '\n' || char === '\t' || char === '\r') {
+          if (!state.lastWasSpace) {
+            state.output += ' '
+          }
+          state.lastWasSpace = true
+          return state
+        }
+
+        state.output += char
+        state.lastWasSpace = false
+        return state
+      },
+      { output: '', lastWasSpace: true }
+    )
+    .output.trim()
+  if (normalized.length <= maxChars) {
+    return normalized
+  }
+
+  return `${normalized.slice(0, maxChars - 3).trimEnd()}...`
+}
+
+function tokenizeFirstShellCommand(command: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let quote: string | null = null
+  let escaped = false
+
+  const pushCurrent = (): void => {
+    if (current) {
+      tokens.push(current)
+      current = ''
+    }
+  }
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!
+
+    if (escaped) {
+      current += char
+      escaped = false
+      continue
+    }
+
+    if (char === '\\' && quote !== '\'') {
+      escaped = true
+      continue
+    }
+
+    if (quote) {
+      if (char === quote) {
+        quote = null
+      } else {
+        current += char
+      }
+      continue
+    }
+
+    if (char === '\'' || char === '"') {
+      quote = char
+      continue
+    }
+
+    if (char === ' ' || char === '\n' || char === '\t') {
+      pushCurrent()
+      continue
+    }
+
+    if (
+      char === '|' ||
+      char === ';' ||
+      char === '&' ||
+      char === '<' ||
+      char === '>'
+    ) {
+      pushCurrent()
+      break
+    }
+
+    current += char
+  }
+
+  pushCurrent()
+  return tokens
+}
+
+function isEnvironmentAssignmentToken(token: string): boolean {
+  const separatorIndex = token.indexOf('=')
+  if (separatorIndex <= 0) {
+    return false
+  }
+
+  const name = token.slice(0, separatorIndex)
+  for (const char of name) {
+    const code = char.charCodeAt(0)
+    const isUpperAlpha = code >= 65 && code <= 90
+    const isLowerAlpha = code >= 97 && code <= 122
+    const isDigit = code >= 48 && code <= 57
+    if (!isUpperAlpha && !isLowerAlpha && !isDigit && char !== '_') {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isBareExecutableToken(token: string): boolean {
+  return Boolean(token) &&
+    !token.includes('/') &&
+    !token.includes('\\') &&
+    !token.includes('=')
+}
+
+function extractShellCommandProbe(command: string): ShellCommandProbe | null {
+  const tokens = tokenizeFirstShellCommand(command)
+  let commandIndex = 0
+
+  while (
+    commandIndex < tokens.length &&
+    isEnvironmentAssignmentToken(tokens[commandIndex]!)
+    ) {
+    commandIndex += 1
+  }
+
+  const executable = tokens[commandIndex]
+  if (!executable || !isBareExecutableToken(executable)) {
+    return null
+  }
+
+  return {
+    executable
+  }
+}
+
+function buildShellHelpStepLabel(executable: string): string {
+  return `Inspect ${executable} help`
+}
+
+function findObservedShellHelp(
+  executionHistory: ExecutionRecord[],
+  executable: string
+): string {
+  const expectedStepLabel = buildShellHelpStepLabel(executable)
+  const match = [...executionHistory]
+    .reverse()
+    .find(
+      (execution) =>
+        execution.function === SHELL_EXECUTE_FUNCTION &&
+        execution.stepLabel === expectedStepLabel
+    )
+
+  return match?.observation || ''
+}
+
+function buildObservedShellHelpSection(
+  executionHistory: ExecutionRecord[]
+): string {
+  const sections: string[] = []
+  const observedExecutables = new Set<string>()
+
+  for (const execution of [...executionHistory].reverse()) {
+    if (execution.function !== SHELL_EXECUTE_FUNCTION) {
+      continue
+    }
+
+    const command = execution.requestedToolInput
+      ? getShellCommandFromToolInput(execution.requestedToolInput)
+      : ''
+    const commandProbe = command ? extractShellCommandProbe(command) : null
+    if (!commandProbe || observedExecutables.has(commandProbe.executable)) {
+      continue
+    }
+
+    const observedHelp = findObservedShellHelp(
+      executionHistory,
+      commandProbe.executable
+    )
+    if (!observedHelp) {
+      continue
+    }
+
+    observedExecutables.add(commandProbe.executable)
+    sections.push(
+      `Executable: ${commandProbe.executable}\n${clipShellObservation(
+        observedHelp,
+        SHELL_HELP_OBSERVATION_MAX_CHARS
+      )}`
+    )
+  }
+
+  return sections.length
+    ? `<observed_shell_help>\n${sections.join('\n\n')}\n</observed_shell_help>\n\n`
+    : ''
+}
+
+function getShellCommandFromToolInput(toolInput: string): string {
+  try {
+    const parsed = JSON.parse(toolInput) as Record<string, unknown>
+    return typeof parsed['command'] === 'string' ? parsed['command'] : ''
+  } catch {
+    return ''
+  }
+}
+
+async function runShellToolInputRepair(params: {
+  caller: LLMCaller
+  executeSystemPrompt: string
+  qualifiedName: string
+  functionConfig: FunctionConfig
+  currentStepLabel: string
+  failedToolInput: string
+  failedObservation: string
+  executionHistory: ExecutionRecord[]
+}): Promise<string | null> {
+  const failedCommand = getShellCommandFromToolInput(params.failedToolInput)
+  const commandProbe = failedCommand
+    ? extractShellCommandProbe(failedCommand)
+    : null
+  const observedHelp = commandProbe
+    ? findObservedShellHelp(params.executionHistory, commandProbe.executable)
+    : ''
+  const paramsSchema = JSON.stringify(params.functionConfig.parameters)
+  const repairSchema = {
+    type: 'object',
+    properties: {
+      type: { type: 'string', enum: ['execute', 'handoff'] },
+      tool_input: {
+        anyOf: [{ type: 'string' }, { type: 'null' }]
+      },
+      draft: {
+        anyOf: [{ type: 'string' }, { type: 'null' }]
+      },
+      intent: {
+        anyOf: [
+          { type: 'string', enum: ['answer', 'clarification', 'blocked', 'error'] },
+          { type: 'null' }
+        ]
+      }
+    },
+    required: ['type', 'tool_input', 'draft', 'intent'],
+    additionalProperties: false
+  }
+  const helpSection = observedHelp
+    ? `<local_command_help>\n${clipShellObservation(
+      observedHelp,
+      SHELL_HELP_OBSERVATION_MAX_CHARS
+    )}\n</local_command_help>\n\n`
+    : ''
+  const prompt = `<function>
+Name: ${params.qualifiedName}
+Description: ${params.functionConfig.description}
+</function>
+
+<current_plan_step>
+Label: ${params.currentStepLabel}
+</current_plan_step>
+
+<parameters_schema>
+${paramsSchema}
+</parameters_schema>
+
+${helpSection}<failed_tool_input>
+${params.failedToolInput}
+</failed_tool_input>
+
+<failed_observation>
+${clipShellObservation(
+    params.failedObservation,
+    SHELL_REPAIR_OBSERVATION_MAX_CHARS
+  )}
+</failed_observation>
+
+<task>
+Repair only the shell tool_input for this same step.
+Use the local command help and the failed observation as the source of truth.
+Return type="execute" with changed tool_input, or type="handoff" if it cannot be repaired without more information.
+</task>`
+
+  const completion = await params.caller.callLLM(
+    prompt,
+    params.executeSystemPrompt,
+    repairSchema,
+    undefined,
+    buildExecutionPromptSections({
+      prompt,
+      systemPrompt: params.executeSystemPrompt,
+      baseSystemPromptContent: EXECUTE_SYSTEM_PROMPT,
+      promptSource:
+        'server/src/core/llm-manager/llm-duties/react-llm-duty/execution.ts',
+      systemPromptSource:
+        'server/src/core/llm-manager/llm-duties/react-llm-duty/constants.ts',
+      schema: repairSchema
+    }),
+    {
+      phase: 'execution',
+      reasoningMode: 'off',
+      emitReasoning: false,
+      streamToProvider: false,
+      maxTokens: SHELL_REPAIR_MAX_TOKENS
+    }
+  )
+
+  const parsed = parseOutput(completion?.output)
+  if (
+    parsed?.['type'] === 'execute' &&
+    typeof parsed['tool_input'] === 'string' &&
+    parsed['tool_input'].trim()
+  ) {
+    return parsed['tool_input'].trim()
+  }
+
+  return null
+}
+
 function shouldInjectContextManifestForExecution(
   toolkitId: string,
   toolId: string
 ): boolean {
   return toolkitId === 'structured_knowledge' && toolId === 'context'
+}
+
+function resolveUniqueFunctionByLeafName(
+  functionName: string
+): string | null {
+  const normalizedFunctionName = functionName.trim()
+  if (!normalizedFunctionName) {
+    return null
+  }
+
+  const matches: string[] = []
+  for (const tool of TOOLKIT_REGISTRY.getFlattenedTools()) {
+    const functions = TOOLKIT_REGISTRY.getToolFunctions(
+      tool.toolkitId,
+      tool.toolId
+    )
+
+    if (functions?.[normalizedFunctionName]) {
+      matches.push(
+        `${tool.toolkitId}.${tool.toolId}.${normalizedFunctionName}`
+      )
+    }
+  }
+
+  return matches.length === 1 ? matches[0]! : null
+}
+
+function resolvePlannedFunctionReference(qualifiedName: string): string | null {
+  const normalizedQualifiedName = qualifiedName.trim()
+  if (!normalizedQualifiedName) {
+    return null
+  }
+
+  const parts = normalizedQualifiedName.split('.').filter(Boolean)
+  if (parts.length >= 3) {
+    const toolkitId = parts[0] || ''
+    const toolId = parts[1] || ''
+    const functionName = parts.slice(2).join('.') || ''
+    const functions = TOOLKIT_REGISTRY.getToolFunctions(toolkitId, toolId)
+
+    if (functions?.[functionName]) {
+      return normalizedQualifiedName
+    }
+  }
+
+  if (parts.length <= 2) {
+    const toolkitId = parts.length === 2 ? parts[0] : undefined
+    const toolId = parts.length === 2 ? parts[1] : parts[0]
+    if (toolId && TOOLKIT_REGISTRY.resolveToolById(toolId, toolkitId)) {
+      return normalizedQualifiedName
+    }
+  }
+
+  const leafName = parts[parts.length - 1] || ''
+  return resolveUniqueFunctionByLeafName(leafName)
 }
 
 function buildExecutionContextManifestSection(
@@ -194,25 +630,79 @@ function stringifyToolPanelValue(value: unknown): string {
   }
 }
 
-function emitToolExecutionToWebApp(params: {
+function createToolGroupId(
+  toolkitId: string,
+  toolId: string,
+  functionName: string
+): string {
+  return `react_${toolkitId}_${toolId}_${functionName}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+}
+
+function getToolDisplayContext(
+  toolkitId: string,
+  toolId: string,
+  functionName: string
+): {
+  toolkitName: string
+  toolName: string
+  toolkitIconName?: string
+  toolIconName?: string
+  key: string
+} {
+  const resolvedTool = TOOLKIT_REGISTRY.resolveToolById(toolId, toolkitId)
+
+  return {
+    toolkitName: resolvedTool?.toolkitName || toolkitId,
+    toolName: resolvedTool?.toolName || toolId,
+    ...(resolvedTool?.toolkitIconName
+      ? { toolkitIconName: resolvedTool.toolkitIconName }
+      : {}),
+    ...(resolvedTool?.toolIconName
+      ? { toolIconName: resolvedTool.toolIconName }
+      : {}),
+    key: `${toolkitId}.${toolId}.${functionName}`
+  }
+}
+
+function emitAgentSkillActivityToWebApp(
+  agentSkillContext: AgentSkillContext,
+  stepLabel: string
+): void {
+  const skillGroupId =
+    `react_agent_skill_${agentSkillContext.id}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+
+  SOCKET_SERVER.emitAnswerToChatClients({
+    answer: `Using Agent Skill: ${agentSkillContext.name}\nStep: ${stepLabel}\nFollowing: ${agentSkillContext.skillPath}`,
+    isToolOutput: true,
+    toolDisplayMode: 'activity_card',
+    activityType: 'agent_skill',
+    status: 'selected',
+    toolGroupId: skillGroupId,
+    key: `agent_skill.${agentSkillContext.id}.using`,
+    agentSkill: {
+      id: agentSkillContext.id,
+      name: agentSkillContext.name,
+      description: agentSkillContext.description,
+      rootPath: agentSkillContext.rootPath,
+      skillPath: agentSkillContext.skillPath,
+      stepLabel
+    }
+  })
+}
+
+function emitToolExecutionInputToWebApp(params: {
   toolkitId: string
   toolId: string
   functionName: string
   toolInput: string
-  output: Record<string, unknown>
-  status: string
-  message: string
+  toolGroupId: string
   stepLabel?: string
 }): void {
-  const resolvedTool = TOOLKIT_REGISTRY.resolveToolById(
+  const displayContext = getToolDisplayContext(
+    params.toolkitId,
     params.toolId,
-    params.toolkitId
+    params.functionName
   )
-  const toolkitName = resolvedTool?.toolkitName || params.toolkitId
-  const toolName = resolvedTool?.toolName || params.toolId
-  const toolGroupId =
-    `react_${params.toolkitId}_${params.toolId}_${params.functionName}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-
   const prefixLines = params.stepLabel
     ? [`Step: ${params.stepLabel}`, '']
     : []
@@ -221,6 +711,111 @@ function emitToolExecutionToWebApp(params: {
     'Input:',
     stringifyToolPanelValue(params.toolInput)
   ].join('\n')
+
+  SOCKET_SERVER.emitAnswerToChatClients({
+    answer: inputMessage,
+    isToolOutput: true,
+    toolDisplayMode: 'activity_card',
+    toolPhase: 'input',
+    ...displayContext,
+    toolGroupId: params.toolGroupId,
+    functionName: params.functionName,
+    toolInput: params.toolInput,
+    ...(params.stepLabel ? { stepLabel: params.stepLabel } : {})
+  })
+}
+
+function emitToolPreparationProgressToWebApp(params: {
+  toolkitId: string
+  toolId: string
+  functionName: string
+  toolGroupId: string
+  message: string
+  stepLabel?: string
+}): void {
+  const message = params.message.trim()
+  if (!message) {
+    return
+  }
+
+  SOCKET_SERVER.emitAnswerToChatClients({
+    answer: message,
+    isToolOutput: true,
+    toolDisplayMode: 'activity_card',
+    toolPhase: 'preparation',
+    ...getToolDisplayContext(
+      params.toolkitId,
+      params.toolId,
+      params.functionName
+    ),
+    toolGroupId: params.toolGroupId,
+    functionName: params.functionName,
+    status: 'running',
+    message,
+    ...(params.stepLabel ? { stepLabel: params.stepLabel } : {})
+  })
+}
+
+function emitToolExecutionOutputDeltaToWebApp(params: {
+  toolkitId: string
+  toolId: string
+  functionName: string
+  toolGroupId: string
+  output: string
+  stepLabel?: string
+}): void {
+  const output = params.output
+  if (!output.trim()) {
+    return
+  }
+
+  SOCKET_SERVER.emitAnswerToChatClients({
+    answer: output,
+    isToolOutput: true,
+    toolDisplayMode: 'activity_card',
+    toolPhase: 'output_delta',
+    ...getToolDisplayContext(
+      params.toolkitId,
+      params.toolId,
+      params.functionName
+    ),
+    toolGroupId: params.toolGroupId,
+    functionName: params.functionName,
+    status: 'running',
+    outputDelta: output,
+    ...(params.stepLabel ? { stepLabel: params.stepLabel } : {})
+  })
+}
+
+function emitToolPreparationOwnerMessage(
+  key: string,
+  toolName: string
+): void {
+  const message = BRAIN.wernicke(key, '', {
+    '{{ tool_name }}': toolName
+  })
+  if (!message) {
+    return
+  }
+
+  void BRAIN.talk(message).catch((error) => {
+    LogHelper.title(`${DUTY_NAME} / execution`)
+    LogHelper.warning(
+      `Failed to emit tool preparation owner message: ${String(error)}`
+    )
+  })
+}
+
+function emitToolExecutionOutputToWebApp(params: {
+  toolkitId: string
+  toolId: string
+  functionName: string
+  toolGroupId: string
+  output: Record<string, unknown>
+  status: string
+  message: string
+  stepLabel?: string
+}): void {
   const outputPayload = {
     status: params.status,
     message: params.message,
@@ -232,27 +827,16 @@ function emitToolExecutionToWebApp(params: {
   ].join('\n')
 
   SOCKET_SERVER.emitAnswerToChatClients({
-    answer: inputMessage,
-    isToolOutput: true,
-    toolDisplayMode: 'activity_card',
-    toolPhase: 'input',
-    toolkitName,
-    toolName,
-    toolGroupId,
-    key: `${params.toolkitId}.${params.toolId}.${params.functionName}`,
-    functionName: params.functionName,
-    toolInput: params.toolInput,
-    ...(params.stepLabel ? { stepLabel: params.stepLabel } : {})
-  })
-  SOCKET_SERVER.emitAnswerToChatClients({
     answer: outputMessage,
     isToolOutput: true,
     toolDisplayMode: 'activity_card',
     toolPhase: 'output',
-    toolkitName,
-    toolName,
-    toolGroupId,
-    key: `${params.toolkitId}.${params.toolId}.${params.functionName}`,
+    ...getToolDisplayContext(
+      params.toolkitId,
+      params.toolId,
+      params.functionName
+    ),
+    toolGroupId: params.toolGroupId,
     functionName: params.functionName,
     status: params.status,
     message: params.message,
@@ -280,7 +864,15 @@ function extractExecutionReplanSteps(
 
         return {
           function: functionName,
-          label
+          label,
+          ...(
+            typeof step['agent_skill_id'] === 'string' &&
+            (step['agent_skill_id'] as string).trim()
+              ? {
+                agentSkillId: (step['agent_skill_id'] as string).trim()
+              }
+              : {}
+          )
         }
       })
   }
@@ -318,6 +910,7 @@ Use only the user request and collected observations to decide whether the reque
   - {"type":"replan","steps":[{"function":"toolkit_id.tool_id.function_name","label":"Short verb-first label"}],"reason":"..."} when more tool steps are still needed.
 - Treat the task as complete only when every requested deliverable is already satisfied or explicitly blocked by the observations.
 - If any requested artifact, transformation, verification, write step, or follow-up action is still missing, choose "replan".
+- Do not add fallback/alternative steps after the primary path already satisfied the deliverable.
 - If a read, probe, or discovery step reveals another instruction or subtask to carry out, the task is still incomplete until that revealed instruction is executed or explicitly blocked.
 - Reading, quoting, or summarizing an instruction does not count as completing the instruction itself.
 - Base your decision strictly on observations, not assumptions.
@@ -325,6 +918,7 @@ Use only the user request and collected observations to decide whether the reque
 - Treat inferred runtime signals (timezone, locale, VPN/proxy, IP/location hints) as environment hints, not confirmed owner facts.
 - If the remaining gap is a missing owner fact or a missing dedicated retrieval step before a write/report step, choose "replan" instead of assuming.
 - If the current best answer would still rely on weak hints or unresolved uncertainty that context or memory could reduce, choose "replan" and add grounding steps instead of handing off an answer.
+- If the current best answer would rely on mutable, current, exact, or environment-specific facts that are not present in observations, choose "replan" and add the smallest useful grounding or verification steps.
 - If your best draft would mention a next step, remaining work, or that something still needs to be done, choose "replan" instead of "handoff".
 - For "replan", "reason" must be a short progress update in present progressive form, written in neutral or first-person phrasing, and end with "...". Example: "Checking additional context files...".
 - For "replan", every step label must be a short user-facing action, start with a verb, and stay under 8 words.
@@ -394,7 +988,7 @@ Use only the user request and collected observations to decide whether the reque
     prompt,
     systemPrompt,
     schema,
-    undefined,
+    caller.history,
     buildExecutionPromptSections({
       prompt,
       systemPrompt,
@@ -446,14 +1040,83 @@ Use only the user request and collected observations to decide whether the reque
   return null
 }
 
+async function resolveStepAgentSkillContext(
+  caller: LLMCaller,
+  step: PlanStep
+): Promise<{
+  context: AgentSkillContext | null
+  error?: string
+}> {
+  if (!step.agentSkillId) {
+    return {
+      context: caller.agentSkillContext || null
+    }
+  }
+
+  const agentSkillContext = await caller.getAgentSkillContext(
+    step.agentSkillId
+  )
+
+  if (!agentSkillContext) {
+    return {
+      context: null,
+      error: `Agent Skill "${step.agentSkillId}" is not installed or enabled.`
+    }
+  }
+
+  LogHelper.title(`${DUTY_NAME} / execution`)
+  LogHelper.debug(
+    `Loaded Agent Skill "${step.agentSkillId}" for step "${step.label}".`
+  )
+  emitAgentSkillActivityToWebApp(agentSkillContext, step.label)
+
+  return {
+    context: agentSkillContext
+  }
+}
+
 export async function runExecutionStep(
   caller: LLMCaller,
   step: PlanStep,
   executionHistory: ExecutionRecord[],
   catalog: Catalog
 ): Promise<ExecutionStepResult> {
-  const qualifiedName = step.function
+  const resolvedQualifiedName = resolvePlannedFunctionReference(step.function)
+
+  if (!resolvedQualifiedName) {
+    return {
+      type: 'executed',
+      execution: {
+        function: step.function,
+        status: 'error',
+        observation: `Invalid function reference "${step.function}". Use a function from the available catalog.`
+      }
+    }
+  }
+
+  if (resolvedQualifiedName !== step.function) {
+    LogHelper.title(`${DUTY_NAME} / execution`)
+    LogHelper.debug(
+      `Normalized planned function "${step.function}" -> "${resolvedQualifiedName}"`
+    )
+  }
+
+  const qualifiedName = resolvedQualifiedName
   const parts = qualifiedName.split('.')
+  const agentSkillResolution = await resolveStepAgentSkillContext(caller, step)
+
+  if (agentSkillResolution.error) {
+    return {
+      type: 'executed',
+      execution: {
+        function: qualifiedName,
+        status: 'error',
+        observation: agentSkillResolution.error
+      }
+    }
+  }
+
+  const agentSkillContext = agentSkillResolution.context
 
   // If the plan only has tool-level references (from tool-level catalog),
   // we need an extra resolution step to pick the right function.
@@ -464,7 +1127,8 @@ export async function runExecutionStep(
       step.label,
       parts,
       executionHistory,
-      catalog
+      catalog,
+      agentSkillContext
     )
   }
 
@@ -544,7 +1208,8 @@ export async function runExecutionStep(
     functionName,
     step.label,
     resolvedConfig,
-    executionHistory
+    executionHistory,
+    agentSkillContext
   )
 }
 
@@ -559,8 +1224,8 @@ async function runToolLevelExecution(
   stepLabel: string,
   parts: string[],
   executionHistory: ExecutionRecord[],
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _catalog: Catalog
+  _catalog: Catalog,
+  agentSkillContext: AgentSkillContext | null
 ): Promise<ExecutionStepResult> {
   const toolkitId = parts[0] || ''
   const toolId = parts[1] || parts[0] || ''
@@ -603,7 +1268,8 @@ async function runToolLevelExecution(
       fnName,
       stepLabel,
       fnConfig,
-      executionHistory
+      executionHistory,
+      agentSkillContext
     )
   }
 
@@ -618,7 +1284,8 @@ async function runToolLevelExecution(
       effectiveToolkitId,
       effectiveToolId,
       toolFunctions as Record<string, FunctionConfig>,
-      executionHistory
+      executionHistory,
+      agentSkillContext
     )
   }
 
@@ -631,7 +1298,8 @@ async function runToolLevelExecution(
     effectiveToolId,
     toolFunctions as Record<string, FunctionConfig>,
     functionEntries,
-    executionHistory
+    executionHistory,
+    agentSkillContext
   )
 }
 
@@ -646,18 +1314,23 @@ async function resolveToolFunctionWithNativeTools(
   toolkitId: string,
   toolId: string,
   toolFunctions: Record<string, FunctionConfig>,
-  executionHistory: ExecutionRecord[]
+  executionHistory: ExecutionRecord[],
+  agentSkillContext: AgentSkillContext | null
 ): Promise<ExecutionStepResult> {
   const toolkitContextSection = buildToolkitContextSection(caller, toolkitId)
   const executionMemorySection = await buildExecutionMemorySection(
     caller,
     toolkitId
   )
+  const previousToolArtifactsSection =
+    await buildPreviousToolArtifactsExecutionSection(caller)
   const contextManifestSection = buildExecutionContextManifestSection(
     caller,
     toolkitId,
     toolId
   )
+  const activeAgentSkillSection =
+    buildActiveAgentSkillSection(agentSkillContext)
   const historySection = formatExecutionHistory(executionHistory)
   const resolveSystemPrompt = buildPhaseSystemPrompt(
     RESOLVE_FUNCTION_SYSTEM_PROMPT,
@@ -675,14 +1348,14 @@ async function resolveToolFunctionWithNativeTools(
     })
   )
 
-  const prompt = `<tool>\n${toolkitId}.${toolId}\n</tool>\n\n<current_plan_step>\n${stepLabel}\n</current_plan_step>\n\n${toolkitContextSection}${contextManifestSection ? `\n\n${contextManifestSection}` : ''}\n\n${executionMemorySection}\n\n<execution_history>\n${historySection}\n</execution_history>\n\n<user_request>\n${caller.input}\n</user_request>\n\n<task>\nSelect the appropriate function for the current plan step and provide arguments.\n</task>`
+  const prompt = `<tool>\n${toolkitId}.${toolId}\n</tool>\n\n<current_plan_step>\n${stepLabel}\n</current_plan_step>\n\n${activeAgentSkillSection ? `${activeAgentSkillSection}\n\n` : ''}${toolkitContextSection}${contextManifestSection ? `\n\n${contextManifestSection}` : ''}\n\n${executionMemorySection}${previousToolArtifactsSection}\n\n<execution_history>\n${historySection}\n</execution_history>\n\n<user_request>\n${caller.input}\n</user_request>\n\n<task>\nSelect the appropriate function for the current plan step and provide arguments.\n</task>`
 
   const result = await caller.callLLMWithTools(
     prompt,
     resolveSystemPrompt,
     tools,
     'auto',
-    undefined,
+    caller.history,
     false,
     buildExecutionPromptSections({
       prompt,
@@ -694,9 +1367,7 @@ async function resolveToolFunctionWithNativeTools(
         'server/src/core/llm-manager/llm-duties/react-llm-duty/constants.ts',
       tools
     }),
-    {
-      phase: 'execution'
-    }
+    TOOL_ARGUMENT_LLM_OPTIONS
   )
 
   if (!result) {
@@ -835,7 +1506,8 @@ async function resolveToolFunctionWithJSONMode(
   effectiveToolId: string,
   toolFunctions: Record<string, FunctionConfig>,
   functionEntries: [string, FunctionConfig][],
-  executionHistory: ExecutionRecord[]
+  executionHistory: ExecutionRecord[],
+  agentSkillContext: AgentSkillContext | null
 ): Promise<ExecutionStepResult> {
   const toolkitContextSection = buildToolkitContextSection(
     caller,
@@ -845,11 +1517,15 @@ async function resolveToolFunctionWithJSONMode(
     caller,
     effectiveToolkitId
   )
+  const previousToolArtifactsSection =
+    await buildPreviousToolArtifactsExecutionSection(caller)
   const contextManifestSection = buildExecutionContextManifestSection(
     caller,
     effectiveToolkitId,
     effectiveToolId
   )
+  const activeAgentSkillSection =
+    buildActiveAgentSkillSection(agentSkillContext)
   const functionsSection = functionEntries
     .map(([fnName, fnConfig]) => {
       const params = JSON.stringify(fnConfig.parameters)
@@ -862,7 +1538,7 @@ async function resolveToolFunctionWithJSONMode(
     RESOLVE_FUNCTION_SYSTEM_PROMPT,
     'execution'
   )
-  const prompt = `<tool>\n${effectiveToolkitId}.${effectiveToolId}\n</tool>\n\n<current_plan_step>\n${stepLabel}\n</current_plan_step>\n\n${toolkitContextSection}${contextManifestSection ? `\n\n${contextManifestSection}` : ''}\n\n${executionMemorySection}\n\n<available_functions>\n${functionsSection}\n</available_functions>\n\n<execution_history>\n${historySection}\n</execution_history>\n\n<user_request>\n${caller.input}\n</user_request>\n\n<task>\nSelect the appropriate function for the current plan step and provide tool_input.\n</task>`
+  const prompt = `<tool>\n${effectiveToolkitId}.${effectiveToolId}\n</tool>\n\n<current_plan_step>\n${stepLabel}\n</current_plan_step>\n\n${activeAgentSkillSection ? `${activeAgentSkillSection}\n\n` : ''}${toolkitContextSection}${contextManifestSection ? `\n\n${contextManifestSection}` : ''}\n\n${executionMemorySection}${previousToolArtifactsSection}\n\n<available_functions>\n${functionsSection}\n</available_functions>\n\n<execution_history>\n${historySection}\n</execution_history>\n\n<user_request>\n${caller.input}\n</user_request>\n\n<task>\nSelect the appropriate function for the current plan step and provide tool_input.\n</task>`
 
   const resolveSchema = {
     type: 'object',
@@ -933,7 +1609,7 @@ async function resolveToolFunctionWithJSONMode(
     prompt,
     resolveSystemPrompt,
     resolveSchema,
-    undefined,
+    caller.history,
     buildExecutionPromptSections({
       prompt,
       systemPrompt: resolveSystemPrompt,
@@ -944,9 +1620,7 @@ async function resolveToolFunctionWithJSONMode(
         'server/src/core/llm-manager/llm-duties/react-llm-duty/constants.ts',
       schema: resolveSchema
     }),
-    {
-      phase: 'execution'
-    }
+    TOOL_ARGUMENT_LLM_OPTIONS
   )
   const parsed = parseOutput(completionResult?.output)
 
@@ -1035,7 +1709,7 @@ async function resolveToolFunctionWithJSONMode(
 /**
  * Asks the LLM to fill tool_input for a known function, then executes it.
  * Uses native tool calling for supported providers, falls back to JSON mode.
- * Retries on invalid input up to MAX_RETRIES_PER_FUNCTION.
+ * Retries malformed local-model tool inputs more patiently.
  */
 async function executeFunction(
   caller: LLMCaller,
@@ -1044,7 +1718,8 @@ async function executeFunction(
   functionName: string,
   stepLabel: string,
   functionConfig: FunctionConfig,
-  executionHistory: ExecutionRecord[]
+  executionHistory: ExecutionRecord[],
+  agentSkillContext: AgentSkillContext | null
 ): Promise<ExecutionStepResult> {
   // --- Native tool calling path ---
   if (caller.supportsNativeTools) {
@@ -1055,7 +1730,8 @@ async function executeFunction(
       functionName,
       stepLabel,
       functionConfig,
-      executionHistory
+      executionHistory,
+      agentSkillContext
     )
   }
 
@@ -1067,7 +1743,8 @@ async function executeFunction(
     functionName,
     stepLabel,
     functionConfig,
-    executionHistory
+    executionHistory,
+    agentSkillContext
   )
 }
 
@@ -1081,7 +1758,8 @@ async function executeFunctionWithNativeTools(
   functionName: string,
   stepLabel: string,
   functionConfig: FunctionConfig,
-  executionHistory: ExecutionRecord[]
+  executionHistory: ExecutionRecord[],
+  agentSkillContext: AgentSkillContext | null
 ): Promise<ExecutionStepResult> {
   const qualifiedName = `${toolkitId}.${toolId}.${functionName}`
   const currentStepLabel = stepLabel || qualifiedName
@@ -1100,11 +1778,14 @@ async function executeFunctionWithNativeTools(
     toolkitId,
     toolId
   )
-  const historySection = formatExecutionHistory(executionHistory)
+  const activeAgentSkillSection =
+    buildActiveAgentSkillSection(agentSkillContext)
   const executeSystemPrompt = buildPhaseSystemPrompt(
     EXECUTE_SYSTEM_PROMPT,
     'execution'
   )
+  const previousToolArtifactsSection =
+    await buildPreviousToolArtifactsExecutionSection(caller)
 
   const tool: OpenAITool = {
     type: 'function',
@@ -1118,8 +1799,10 @@ async function executeFunctionWithNativeTools(
   let retries = 0
   let lastError = ''
   let toolFailureRetries = 0
+  let shellRepairAttempts = 0
   let lastFailedToolInput: string | null = null
   const attemptedInputsInCurrentStep = new Set<string>()
+  const maxRetriesPerFunction = MAX_RETRIES_PER_FUNCTION
 
   const runValidatedToolInput = async (
     toolInputRaw: string
@@ -1153,6 +1836,7 @@ async function executeFunctionWithNativeTools(
       )
       return { retry: true }
     }
+
     const normalizedCurrentAttempt = normalizeToolInputForComparison(
       validatedToolInput
     )
@@ -1187,6 +1871,40 @@ async function executeFunctionWithNativeTools(
     }
 
     if (toolResult.execution.status === 'error') {
+      if (qualifiedName === SHELL_EXECUTE_FUNCTION) {
+        if (shellRepairAttempts < MAX_SHELL_REPAIR_ATTEMPTS) {
+          shellRepairAttempts += 1
+          const repairedToolInput = await runShellToolInputRepair({
+            caller,
+            executeSystemPrompt,
+            qualifiedName,
+            functionConfig,
+            currentStepLabel,
+            failedToolInput: validatedToolInput,
+            failedObservation: toolResult.execution.observation,
+            executionHistory
+          })
+
+          if (
+            repairedToolInput &&
+            normalizeToolInputForComparison(repairedToolInput) !==
+            normalizeToolInputForComparison(validatedToolInput)
+          ) {
+            lastError = extractFailureMessageFromObservation(
+              toolResult.execution.observation
+            )
+            lastFailedToolInput = validatedToolInput
+            const repairedResult = await runValidatedToolInput(repairedToolInput)
+            if ('retry' in repairedResult) {
+              return { retry: true }
+            }
+            return repairedResult
+          }
+        }
+
+        return toolResult
+      }
+
       if (toolFailureRetries < MAX_TOOL_FAILURE_RETRIES) {
         toolFailureRetries += 1
         lastError = extractFailureMessageFromObservation(
@@ -1200,18 +1918,23 @@ async function executeFunctionWithNativeTools(
     return toolResult
   }
 
-  while (retries <= MAX_RETRIES_PER_FUNCTION) {
+  while (retries <= maxRetriesPerFunction) {
+    const historySection = formatExecutionHistory(executionHistory)
+    const observedShellHelpSection =
+      qualifiedName === SHELL_EXECUTE_FUNCTION
+        ? buildObservedShellHelpSection(executionHistory)
+        : ''
     const retryNote = lastError
       ? `\n\nPrevious attempt failed: ${lastError}.${lastFailedToolInput ? `\nPrevious failed tool_input: ${lastFailedToolInput}\nDo not reuse the same tool_input. Change the arguments to address the failure.` : ' Please fix the arguments.'}`
       : ''
-    const prompt = `<current_plan_step>\nNumber: ${currentStepNumber}\nLabel: ${currentStepLabel}\nInstruction: Execute only this step now and focus on this step objective.${previousInputsSection}\n</current_plan_step>\n\n${toolkitContextSection}${contextManifestSection ? `\n\n${contextManifestSection}` : ''}\n\n${executionMemorySection}\n\n<execution_history>\n${historySection}\n</execution_history>\n\n<user_request>\n${caller.input}\n</user_request>${retryNote ? `\n\n<retry_context>\n${retryNote.trim()}\n</retry_context>` : ''}`
+    const prompt = `<current_plan_step>\nNumber: ${currentStepNumber}\nLabel: ${currentStepLabel}\nInstruction: Execute only this step now and focus on this step objective.${previousInputsSection}\n</current_plan_step>\n\n${activeAgentSkillSection ? `${activeAgentSkillSection}\n\n` : ''}${toolkitContextSection}${contextManifestSection ? `\n\n${contextManifestSection}` : ''}\n\n${executionMemorySection}${previousToolArtifactsSection}\n\n${observedShellHelpSection}<execution_history>\n${historySection}\n</execution_history>\n\n<user_request>\n${caller.input}\n</user_request>${retryNote ? `\n\n<retry_context>\n${retryNote.trim()}\n</retry_context>` : ''}`
 
     const result = await caller.callLLMWithTools(
       prompt,
       executeSystemPrompt,
       [tool],
       'auto',
-      undefined,
+      caller.history,
       false,
       buildExecutionPromptSections({
         prompt,
@@ -1223,9 +1946,7 @@ async function executeFunctionWithNativeTools(
           'server/src/core/llm-manager/llm-duties/react-llm-duty/constants.ts',
         tools: [tool]
       }),
-      {
-        phase: 'execution'
-      }
+      TOOL_ARGUMENT_LLM_OPTIONS
     )
 
     if (!result) {
@@ -1342,7 +2063,7 @@ async function executeFunctionWithNativeTools(
     execution: {
       function: qualifiedName,
       status: 'error',
-      observation: `Failed after ${MAX_RETRIES_PER_FUNCTION + 1} attempts: ${lastError}`
+      observation: `Failed after ${maxRetriesPerFunction + 1} attempts: ${lastError}`
     }
   }
 }
@@ -1359,7 +2080,8 @@ async function executeFunctionWithJSONMode(
   functionName: string,
   stepLabel: string,
   functionConfig: FunctionConfig,
-  executionHistory: ExecutionRecord[]
+  executionHistory: ExecutionRecord[],
+  agentSkillContext: AgentSkillContext | null
 ): Promise<ExecutionStepResult> {
   const qualifiedName = `${toolkitId}.${toolId}.${functionName}`
   const currentStepLabel = stepLabel || qualifiedName
@@ -1379,11 +2101,14 @@ async function executeFunctionWithJSONMode(
     toolkitId,
     toolId
   )
-  const historySection = formatExecutionHistory(executionHistory)
+  const activeAgentSkillSection =
+    buildActiveAgentSkillSection(agentSkillContext)
   const executeSystemPrompt = buildPhaseSystemPrompt(
     EXECUTE_SYSTEM_PROMPT,
     'execution'
   )
+  const previousToolArtifactsSection =
+    await buildPreviousToolArtifactsExecutionSection(caller)
 
   const executeSchema = {
     type: 'object',
@@ -1435,20 +2160,27 @@ async function executeFunctionWithJSONMode(
   let retries = 0
   let lastError = ''
   let toolFailureRetries = 0
+  let shellRepairAttempts = 0
   let lastFailedToolInput: string | null = null
   const attemptedInputsInCurrentStep = new Set<string>()
+  const maxRetriesPerFunction = MAX_RETRIES_PER_FUNCTION
 
-  while (retries <= MAX_RETRIES_PER_FUNCTION) {
+  while (retries <= maxRetriesPerFunction) {
+    const historySection = formatExecutionHistory(executionHistory)
+    const observedShellHelpSection =
+      qualifiedName === SHELL_EXECUTE_FUNCTION
+        ? buildObservedShellHelpSection(executionHistory)
+        : ''
     const retryNote = lastError
       ? `\n\nPrevious attempt failed: ${lastError}.${lastFailedToolInput ? `\nPrevious failed tool_input: ${lastFailedToolInput}\nDo not reuse the same tool_input. Change the arguments to address the failure.` : ' Please fix the tool_input.'}`
       : ''
-    const prompt = `<function>\nName: ${qualifiedName}\nDescription: ${functionConfig.description}\n</function>\n\n<current_plan_step>\nNumber: ${currentStepNumber}\nLabel: ${currentStepLabel}\nInstruction: Execute only this step now and focus on this step objective.${previousInputsSection}\n</current_plan_step>\n\n<parameters_schema>\n${paramsSchema}\n</parameters_schema>\n\n${toolkitContextSection}${contextManifestSection ? `\n\n${contextManifestSection}` : ''}\n\n${executionMemorySection}\n\n<execution_history>\n${historySection}\n</execution_history>\n\n<user_request>\n${caller.input}\n</user_request>${retryNote ? `\n\n<retry_context>\n${retryNote.trim()}\n</retry_context>` : ''}\n\n<task>\nProvide the tool_input for this function.\n</task>`
+    const prompt = `<function>\nName: ${qualifiedName}\nDescription: ${functionConfig.description}\n</function>\n\n<current_plan_step>\nNumber: ${currentStepNumber}\nLabel: ${currentStepLabel}\nInstruction: Execute only this step now and focus on this step objective.${previousInputsSection}\n</current_plan_step>\n\n<parameters_schema>\n${paramsSchema}\n</parameters_schema>\n\n${activeAgentSkillSection ? `${activeAgentSkillSection}\n\n` : ''}${toolkitContextSection}${contextManifestSection ? `\n\n${contextManifestSection}` : ''}\n\n${executionMemorySection}${previousToolArtifactsSection}\n\n${observedShellHelpSection}<execution_history>\n${historySection}\n</execution_history>\n\n<user_request>\n${caller.input}\n</user_request>${retryNote ? `\n\n<retry_context>\n${retryNote.trim()}\n</retry_context>` : ''}\n\n<task>\nProvide the tool_input for this function.\n</task>`
 
     const completionResult = await caller.callLLM(
       prompt,
       executeSystemPrompt,
       executeSchema,
-      undefined,
+      caller.history,
       buildExecutionPromptSections({
         prompt,
         systemPrompt: executeSystemPrompt,
@@ -1459,9 +2191,7 @@ async function executeFunctionWithJSONMode(
           'server/src/core/llm-manager/llm-duties/react-llm-duty/constants.ts',
         schema: executeSchema
       }),
-      {
-        phase: 'execution'
-      }
+      TOOL_ARGUMENT_LLM_OPTIONS
     )
     if (!completionResult) {
       const providerFailureObservation =
@@ -1555,6 +2285,7 @@ async function executeFunctionWithJSONMode(
         )
         continue
       }
+
       const normalizedCurrentAttempt = normalizeToolInputForComparison(
         validatedToolInput
       )
@@ -1590,6 +2321,56 @@ async function executeFunctionWithJSONMode(
       }
 
       if (toolResult.execution.status === 'error') {
+        if (qualifiedName === SHELL_EXECUTE_FUNCTION) {
+          if (shellRepairAttempts < MAX_SHELL_REPAIR_ATTEMPTS) {
+            shellRepairAttempts += 1
+            const repairedToolInput = await runShellToolInputRepair({
+              caller,
+              executeSystemPrompt,
+              qualifiedName,
+              functionConfig,
+              currentStepLabel,
+              failedToolInput: validatedToolInput,
+              failedObservation: toolResult.execution.observation,
+              executionHistory
+            })
+
+            if (
+              repairedToolInput &&
+              normalizeToolInputForComparison(repairedToolInput) !==
+              normalizeToolInputForComparison(validatedToolInput)
+            ) {
+              lastError = extractFailureMessageFromObservation(
+                toolResult.execution.observation
+              )
+              lastFailedToolInput = validatedToolInput
+              const repairedValidation = validateToolInput(
+                repairedToolInput,
+                functionConfig.parameters
+              )
+              if (!repairedValidation.isValid) {
+                retries += 1
+                lastError =
+                  repairedValidation.message ||
+                  'repaired tool_input does not match schema'
+                continue
+              }
+
+              return await runToolExecution(
+                toolkitId,
+                toolId,
+                functionName,
+                repairedValidation.repairedToolInput ?? repairedToolInput,
+                functionConfig,
+                repairedValidation.parsedValue,
+                currentStepLabel
+              )
+            }
+          }
+
+          return toolResult
+        }
+
         if (toolFailureRetries < MAX_TOOL_FAILURE_RETRIES) {
           toolFailureRetries += 1
           lastError = extractFailureMessageFromObservation(
@@ -1612,7 +2393,7 @@ async function executeFunctionWithJSONMode(
     execution: {
       function: qualifiedName,
       status: 'error',
-      observation: `Failed after ${MAX_RETRIES_PER_FUNCTION + 1} attempts: ${lastError}`
+      observation: `Failed after ${maxRetriesPerFunction + 1} attempts: ${lastError}`
     }
   }
 }
@@ -1638,6 +2419,11 @@ export async function runToolExecution(
     functionName: string
     toolInput: string
     parsedInput?: Record<string, unknown>
+    onProgress?: (progress: {
+      message: string
+      key?: string
+      data?: Record<string, unknown>
+    }) => void
   } = {
     toolId,
     toolkitId,
@@ -1665,29 +2451,63 @@ export async function runToolExecution(
     }
   }
 
-  // For bash commands, write the command to a temp script file so that
-  // base-tool's escapeShellArg does not destroy shell metacharacters
-  // (quotes, pipes, redirects, etc.). The bash tool receives a simple
+  // For shell commands, write the command to a temp script file so that
+  // base-tool's argument escaping does not destroy shell metacharacters
+  // (quotes, pipes, redirects, etc.). The shell tool receives a simple
   // file path instead of a raw command string.
-  let bashScriptPath: string | null = null
+  let shellScriptPath: string | null = null
   if (
-    toolId === 'bash' &&
-    functionName === 'executeBashCommand' &&
+    toolId === 'shell' &&
+    functionName === 'executeCommand' &&
     toolExecutionInput.parsedInput?.['command']
   ) {
     const command = toolExecutionInput.parsedInput['command'] as string
-    const scriptDir = join(tmpdir(), 'leon_bash_scripts')
+    const scriptDir = join(tmpdir(), 'leon_shell_scripts')
     mkdirSync(scriptDir, { recursive: true })
-    bashScriptPath = join(
+    const scriptExtension = SystemHelper.isWindows() ? 'ps1' : 'sh'
+    shellScriptPath = join(
       scriptDir,
-      `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.sh`
+      `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.${scriptExtension}`
     )
-    writeFileSync(bashScriptPath, `set -e\n${command}\n`, { mode: 0o755 })
+    const escapedLeonHomePath = SystemHelper.isWindows()
+      ? LEON_HOME_PATH.replaceAll('\'', '\'\'')
+      : LEON_HOME_PATH.replaceAll('"', '\\"')
+    const scriptContent = SystemHelper.isWindows()
+      ? [
+        '# Leon-injected managed runtime shims. This block is not generated by the LLM.',
+        `$env:LEON_HOME = '${escapedLeonHomePath}'`,
+        `$env:LEON_HOME_PATH = '${escapedLeonHomePath}'`,
+        '',
+        RuntimeHelper.buildManagedRuntimePowerShellFunctions(),
+        '',
+        '# LLM-generated PowerShell command starts here.',
+        '$ErrorActionPreference = "Stop"',
+        command,
+        ''
+      ].join('\n')
+      : [
+        '# Leon-injected managed runtime shims. This block is not generated by the LLM.',
+        `export LEON_HOME="${escapedLeonHomePath}"`,
+        `export LEON_HOME_PATH="${escapedLeonHomePath}"`,
+        '',
+        RuntimeHelper.buildManagedRuntimeShellFunctions(),
+        '',
+        '# LLM-generated shell command starts here.',
+        'set -e',
+        command,
+        ''
+      ].join('\n')
+
+    writeFileSync(
+      shellScriptPath,
+      scriptContent,
+      { mode: 0o755 }
+    )
 
     // Replace the command with the script path
     toolExecutionInput.parsedInput = {
       ...toolExecutionInput.parsedInput,
-      command: bashScriptPath
+      command: shellScriptPath
     }
     toolExecutionInput.toolInput = JSON.stringify(
       toolExecutionInput.parsedInput
@@ -1698,8 +2518,91 @@ export async function runToolExecution(
   LogHelper.debug(`Running tool: ${qualifiedName}`)
   LogHelper.debug(`Tool input: ${toolInput}`)
 
+  const toolGroupId = createToolGroupId(toolkitId, toolId, functionName)
+  emitToolExecutionInputToWebApp({
+    toolkitId,
+    toolId,
+    functionName,
+    toolInput: requestedToolInput,
+    toolGroupId,
+    ...(stepLabel ? { stepLabel } : {})
+  })
+
+  const toolDisplayContext = getToolDisplayContext(
+    toolkitId,
+    toolId,
+    functionName
+  )
+  let didNotifyOwnerPreparationStarted = false
+  let didNotifyOwnerPreparationReady = false
+  let didObservePreparationFailure = false
+  toolExecutionInput.onProgress = (progress): void => {
+    if (progress.key === 'bridges.tools.command_output_delta') {
+      const output =
+        typeof progress.data?.['output'] === 'string'
+          ? progress.data['output']
+          : progress.message
+      emitToolExecutionOutputDeltaToWebApp({
+        toolkitId,
+        toolId,
+        functionName,
+        toolGroupId,
+        output,
+        ...(stepLabel ? { stepLabel } : {})
+      })
+      return
+    }
+
+    emitToolPreparationProgressToWebApp({
+      toolkitId,
+      toolId,
+      functionName,
+      toolGroupId,
+      message: progress.message,
+      ...(stepLabel ? { stepLabel } : {})
+    })
+
+    if (!progress.key) {
+      return
+    }
+
+    if (TOOL_PREPARATION_FAILED_REPORT_KEYS.has(progress.key)) {
+      didObservePreparationFailure = true
+      return
+    }
+
+    if (
+      !didNotifyOwnerPreparationStarted &&
+      TOOL_PREPARATION_STARTED_REPORT_KEYS.has(progress.key)
+    ) {
+      didNotifyOwnerPreparationStarted = true
+      emitToolPreparationOwnerMessage(
+        'react.tool.preparing',
+        toolDisplayContext.toolName
+      )
+      return
+    }
+
+    if (
+      didNotifyOwnerPreparationStarted &&
+      !didNotifyOwnerPreparationReady &&
+      !didObservePreparationFailure &&
+      TOOL_PREPARATION_READY_REPORT_KEYS.has(progress.key)
+    ) {
+      didNotifyOwnerPreparationReady = true
+      emitToolPreparationOwnerMessage(
+        'react.tool.ready',
+        toolDisplayContext.toolName
+      )
+    }
+  }
+
   const toolExecutionResult =
     await TOOL_EXECUTOR.executeTool(toolExecutionInput)
+  const outputLogPath =
+    typeof toolExecutionResult.data?.output_log_path === 'string'
+      ? toolExecutionResult.data.output_log_path
+      : null
   const toolOutput = toolExecutionResult.data?.output || {}
   const nestedResult = asRecord(toolOutput['result'])
   const toolOutputSuccess = toolOutput['success']
@@ -1712,23 +2615,23 @@ export async function runToolExecution(
     typeof nestedResult?.['error'] === 'string'
       ? nestedResult['error']
       : null
-  const hasDomainFailure =
+  const hasObservedToolFailure =
     toolExecutionResult.status === 'success' &&
     (toolOutputSuccess === false || nestedResultSuccess === false)
-  const effectiveStatus = hasDomainFailure
-    ? 'error'
+  const effectiveStatus = hasObservedToolFailure
+    ? 'observed'
     : toolExecutionResult.status
   const effectiveMessage =
-    (hasDomainFailure && (nestedResultError || toolOutputError)) ||
+    (hasObservedToolFailure && (nestedResultError || toolOutputError)) ||
     toolExecutionResult.message
 
   LogHelper.title(`${DUTY_NAME} / execution`)
-  if (hasDomainFailure) {
+  if (hasObservedToolFailure) {
     LogHelper.warning(
-      'Tool result normalized to [error]: tool output reported success=false'
+      'Tool result kept as [observed]: tool output reported success=false'
     )
   }
-  if (effectiveStatus !== 'success') {
+  if (effectiveStatus === 'error') {
     LogHelper.debug(
       `Tool result: ${qualifiedName} [${effectiveStatus}] — ${effectiveMessage}`
     )
@@ -1737,11 +2640,11 @@ export async function runToolExecution(
     `Tool output: ${JSON.stringify(toolExecutionResult.data?.output)}`
   )
 
-  emitToolExecutionToWebApp({
+  emitToolExecutionOutputToWebApp({
     toolkitId,
     toolId,
     functionName,
-    toolInput: requestedToolInput,
+    toolGroupId,
     output: toolExecutionResult.data?.output || {},
     status: effectiveStatus,
     message: effectiveMessage,
@@ -1773,7 +2676,7 @@ export async function runToolExecution(
 
   // Check for missing settings
   const missingSettings =
-    effectiveStatus === 'error'
+    effectiveStatus !== 'success'
       ? ((toolOutput['missing_settings'] as
           | string[]
           | undefined) ??
@@ -1782,7 +2685,7 @@ export async function runToolExecution(
           | undefined))
       : undefined
   const settingsPath =
-    effectiveStatus === 'error'
+    effectiveStatus !== 'success'
       ? ((toolOutput['settings_path'] as
           | string
           | undefined) ??
@@ -1816,15 +2719,16 @@ export async function runToolExecution(
     ...(effectiveStatus !== toolExecutionResult.status
       ? { raw_status: toolExecutionResult.status }
       : {}),
+    ...(outputLogPath ? { output_log_path: outputLogPath } : {}),
     message: effectiveMessage,
     data: toolExecutionResult.data,
-    ...(hasDomainFailure
+    ...(hasObservedToolFailure
       ? {
-          tool_output_failure: {
-            success: nestedResultSuccess ?? toolOutputSuccess,
-            error: nestedResultError || toolOutputError || effectiveMessage
-          }
+        observed_tool_failure: {
+          success: nestedResultSuccess ?? toolOutputSuccess,
+          error: nestedResultError || toolOutputError || effectiveMessage
         }
+      }
       : {})
   })
 

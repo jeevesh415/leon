@@ -5,9 +5,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import type { MessageLog } from '@/types'
 import {
-  CONTEXT_PATH,
   LEON_PULSE_ENABLED,
-  LEON_PULSE_INTERVAL_MS
+  LEON_PULSE_INTERVAL_MS,
+  PROFILE_CONTEXT_PATH
 } from '@/constants'
 import { runInference } from '@/core/llm-manager/inference'
 import { DateHelper } from '@/helpers/date-helper'
@@ -103,7 +103,7 @@ interface PulseOwnerReactionOutput {
   behavioral_principle?: string | null
 }
 
-const PRIVATE_CONTEXT_DIR = path.join(CONTEXT_PATH, 'private')
+const PRIVATE_CONTEXT_DIR = path.join(PROFILE_CONTEXT_PATH, 'private')
 const PULSE_MARKDOWN_PATH = path.join(PRIVATE_CONTEXT_DIR, 'PULSE.md')
 const PULSE_STATE_PATH = path.join(PRIVATE_CONTEXT_DIR, '.leon-pulse-state.json')
 const MAX_PENDING_MATTERS = 6
@@ -264,12 +264,22 @@ export default class PulseManager {
       LogHelper.success('New instance')
 
       PulseManager.instance = this
+      if (!LEON_PULSE_ENABLED) {
+        return
+      }
+
       this.ensureLoaded()
       this.persist()
     }
   }
 
   public start(): void {
+    if (!LEON_PULSE_ENABLED) {
+      LogHelper.title('Pulse Manager')
+      LogHelper.info('Pulse is disabled')
+      return
+    }
+
     const state = this.ensureLoaded()
     state.enabled = LEON_PULSE_ENABLED
     state.intervalMs = LEON_PULSE_INTERVAL_MS
@@ -278,13 +288,6 @@ export default class PulseManager {
     if (this.intervalId || this.initialTimerId) {
       return
     }
-
-    if (!LEON_PULSE_ENABLED) {
-      LogHelper.title('Pulse Manager')
-      LogHelper.info('Pulse is disabled')
-      return
-    }
-
     const initialDelayMs = Math.min(
       LEON_PULSE_INTERVAL_MS,
       PULSE_INITIAL_DELAY_MS
@@ -312,6 +315,10 @@ export default class PulseManager {
   }
 
   public async observeOwnerUtterance(utterance: string): Promise<void> {
+    if (!LEON_PULSE_ENABLED) {
+      return
+    }
+
     const ownerMessage = normalizeText(utterance)
     if (!ownerMessage) {
       return
@@ -332,6 +339,10 @@ export default class PulseManager {
   }
 
   public async tick(reason: 'initial' | 'scheduled' | 'manual'): Promise<void> {
+    if (!LEON_PULSE_ENABLED) {
+      return
+    }
+
     if (this.isTickPending) {
       return
     }
@@ -810,7 +821,7 @@ export default class PulseManager {
     changedSignals: string[]
     nextStamps: Record<string, number>
   }> {
-    const entries = await fs.promises.readdir(CONTEXT_PATH, {
+    const entries = await fs.promises.readdir(PROFILE_CONTEXT_PATH, {
       withFileTypes: true
     })
     const nextStamps: Record<string, number> = {}
@@ -821,7 +832,7 @@ export default class PulseManager {
         continue
       }
 
-      const entryPath = path.join(CONTEXT_PATH, entry.name)
+      const entryPath = path.join(PROFILE_CONTEXT_PATH, entry.name)
       try {
         const stats = await fs.promises.stat(entryPath)
         nextStamps[entry.name] = stats.mtimeMs
@@ -1113,14 +1124,17 @@ export default class PulseManager {
         route: 'pulse',
         toolExecutions
       })
-      await core.SELF_MODEL_MANAGER.observeTurn({
-        userMessage: `${PULSE_REACT_SENTINEL} ${matter.turnPrompt}`,
-        assistantMessage: output,
-        sentAt: nowTs,
-        route: 'pulse',
-        finalIntent,
-        toolExecutions
-      })
+      core.POST_TURN_MAINTENANCE_QUEUE.enqueue(
+        'pulse self-model reflection',
+        () => core.SELF_MODEL_MANAGER.observeTurn({
+          userMessage: `${PULSE_REACT_SENTINEL} ${matter.turnPrompt}`,
+          assistantMessage: output,
+          sentAt: nowTs,
+          route: 'pulse',
+          finalIntent,
+          toolExecutions
+        })
+      )
     }
 
     if (output && matter.notifyOwner) {
@@ -1416,7 +1430,7 @@ export default class PulseManager {
         userMessage: string
         assistantMessage: string
         sentAt: number
-        route: 'react' | 'workflow' | 'pulse'
+        route: 'react' | 'controlled' | 'pulse'
         toolExecutions?: Array<{
           functionName: string
           status: 'success' | 'error'
@@ -1434,7 +1448,7 @@ export default class PulseManager {
         userMessage: string
         assistantMessage: string
         sentAt?: number
-        route: 'react' | 'workflow' | 'pulse'
+        route: 'react' | 'controlled' | 'pulse'
         finalIntent?: 'answer' | 'clarification' | 'cancelled' | 'blocked' | 'error'
         toolExecutions?: Array<{
           functionName: string
@@ -1446,6 +1460,9 @@ export default class PulseManager {
         text: string,
         confidence?: number
       ): Promise<void>
+    }
+    POST_TURN_MAINTENANCE_QUEUE: {
+      enqueue(label: string, task: () => Promise<void> | void): void
     }
     SOCKET_SERVER: {
       emitAnswerToChatClients(answerData: unknown): void
@@ -1516,6 +1533,10 @@ export default class PulseManager {
   }
 
   private persist(): void {
+    if (!LEON_PULSE_ENABLED) {
+      return
+    }
+
     const state = this.ensureLoaded()
 
     try {

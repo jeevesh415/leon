@@ -9,6 +9,7 @@ import { createGroq } from '@ai-sdk/groq'
 import { createWebSocketFetch } from '@vercel/ai-sdk-openai-websocket-fetch'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 
+import { CONFIG_MANAGER } from '@/config'
 import type {
   CompletionParams,
   LLMReasoningMode,
@@ -40,6 +41,7 @@ interface AISDKRemoteProviderConfig {
   requiresApiKey?: boolean
   sendApiKeyAsBearer?: boolean
   headers?: (apiKey: string) => Record<string, string>
+  transformRequestBody?: (args: Record<string, unknown>) => Record<string, unknown>
 }
 
 interface CallState {
@@ -72,9 +74,13 @@ export default class AISDKRemoteLLMProvider {
   constructor(
     config: AISDKRemoteProviderConfig
   ) {
+    const configuredAPIKeyEnv =
+      CONFIG_MANAGER.getProviderAPIKeyEnv(config.providerName) ||
+      config.apiKeyEnv
+
     this.config = config
     this.name = config.name
-    this.apiKey = process.env[config.apiKeyEnv]
+    this.apiKey = process.env[configuredAPIKeyEnv]
     this.model = config.model
 
     LogHelper.title(this.name)
@@ -138,6 +144,9 @@ export default class AISDKRemoteLLMProvider {
         name: this.config.providerName,
         baseURL: this.config.baseURL,
         includeUsage: true,
+        ...(this.config.transformRequestBody
+          ? { transformRequestBody: this.config.transformRequestBody }
+          : {}),
         ...(
           this.config.sendApiKeyAsBearer === false || !apiKey
             ? {}
@@ -754,6 +763,56 @@ export default class AISDKRemoteLLMProvider {
     }
   }
 
+  private serializeStreamError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message
+    }
+
+    if (typeof error === 'string') {
+      return error
+    }
+
+    if (!error || typeof error !== 'object') {
+      return String(error)
+    }
+
+    try {
+      return JSON.stringify(error)
+    } catch {
+      return String(error)
+    }
+  }
+
+  private createStreamError(error: unknown): Error {
+    if (error instanceof Error) {
+      return error
+    }
+
+    const streamError = new Error(this.serializeStreamError(error))
+
+    if (error && typeof error === 'object') {
+      const errorObject = error as Record<string, unknown>
+      const streamErrorWithMetadata = streamError as Error & {
+        status?: number
+        statusCode?: number
+        cause?: unknown
+      }
+
+      if (typeof errorObject['name'] === 'string') {
+        streamError.name = errorObject['name'] as string
+      }
+      if (typeof errorObject['statusCode'] === 'number') {
+        streamErrorWithMetadata.statusCode = errorObject['statusCode'] as number
+      }
+      if (typeof errorObject['status'] === 'number') {
+        streamErrorWithMetadata.status = errorObject['status'] as number
+      }
+      streamErrorWithMetadata.cause = error
+    }
+
+    return streamError
+  }
+
   private buildOpenAICompatiblePayload(
     state: CallState
   ): Record<string, unknown> {
@@ -1012,11 +1071,7 @@ export default class AISDKRemoteLLMProvider {
       }
 
       if (type === 'error') {
-        throw (
-          part['error'] instanceof Error
-            ? part['error']
-            : new Error(String(part['error']))
-        )
+        throw this.createStreamError(part['error'])
       }
     }
 

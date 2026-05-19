@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import {
   HOST,
   PORT,
+  PROFILE_CONVERSATION_LOG_PATH,
   PYTHON_TCP_SERVER_HOST,
   PYTHON_TCP_SERVER_PORT
 } from '@/constants'
@@ -22,6 +23,7 @@ import ContextManager from '@/core/context-manager'
 import MemoryManager from '@/core/memory-manager'
 import SelfModelManager from '@/core/self-model-manager'
 import PulseManager from '@/core/pulse-manager'
+import PostTurnMaintenanceQueue from '@/core/post-turn-maintenance-queue'
 import ToolExecutor from '@/core/tool-executor'
 import { ConversationLogger } from '@/conversation-logger'
 import { ToolCallLogger } from '@/tool-call-logger'
@@ -49,6 +51,7 @@ export const LLM_MANAGER = new LLMManager()
 export const CONVERSATION_LOGGER = new ConversationLogger({
   loggerName: 'Conversation Logger',
   fileName: 'conversation_log.json',
+  filePath: PROFILE_CONVERSATION_LOG_PATH,
   nbOfLogsToKeep: 1_024,
   nbOfLogsToLoad: 256
 })
@@ -72,6 +75,7 @@ export const CONTEXT_MANAGER = new ContextManager()
 export const MEMORY_MANAGER = new MemoryManager()
 export const SELF_MODEL_MANAGER = new SelfModelManager()
 export const PULSE_MANAGER = new PulseManager()
+export const POST_TURN_MAINTENANCE_QUEUE = new PostTurnMaintenanceQueue()
 
 export const STT = new SpeechToText()
 

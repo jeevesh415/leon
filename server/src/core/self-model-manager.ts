@@ -2,7 +2,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 
-import { CONTEXT_PATH } from '@/constants'
+import {
+  LEON_PRIVATE_DIARY_ENABLED,
+  PROFILE_CONTEXT_PATH
+} from '@/constants'
 import { runInference } from '@/core/llm-manager/inference'
 import { DateHelper } from '@/helpers/date-helper'
 import { LogHelper } from '@/helpers/log-helper'
@@ -24,7 +27,7 @@ export interface SelfModelObservationInput {
   userMessage: string
   assistantMessage: string
   sentAt?: number
-  route: 'react' | 'workflow' | 'pulse'
+  route: 'react' | 'controlled' | 'pulse'
   finalIntent?: FinalIntent
   toolExecutions?: ToolExecutionDigest[]
 }
@@ -53,7 +56,7 @@ interface BehavioralPrinciple {
 
 interface TurnDigest {
   at: string
-  route: 'react' | 'workflow' | 'pulse'
+  route: 'react' | 'controlled' | 'pulse'
   finalIntent: FinalIntent
   ownerSummary: string
   leonSummary: string
@@ -106,7 +109,7 @@ interface ReflectionPatch {
   }>
 }
 
-const PRIVATE_CONTEXT_DIR = path.join(CONTEXT_PATH, 'private')
+const PRIVATE_CONTEXT_DIR = path.join(PROFILE_CONTEXT_PATH, 'private')
 const PRIVATE_DIARY_PATH = path.join(
   PRIVATE_CONTEXT_DIR,
   'LEON_PRIVATE_DIARY.md'
@@ -228,12 +231,20 @@ export default class SelfModelManager {
       LogHelper.success('New instance')
 
       SelfModelManager.instance = this
+      if (!LEON_PRIVATE_DIARY_ENABLED) {
+        return
+      }
+
       this.ensureLoaded()
       this.persist()
     }
   }
 
   public getSnapshot(): string {
+    if (!LEON_PRIVATE_DIARY_ENABLED) {
+      return ''
+    }
+
     const state = this.ensureLoaded()
     const lines = ['Leon Self-Model Snapshot:']
 
@@ -269,11 +280,18 @@ export default class SelfModelManager {
   }
 
   public getDiaryPath(): string {
-    this.ensureLoaded()
+    if (LEON_PRIVATE_DIARY_ENABLED) {
+      this.ensureLoaded()
+    }
+
     return PRIVATE_DIARY_PATH
   }
 
   public async observeTurn(input: SelfModelObservationInput): Promise<void> {
+    if (!LEON_PRIVATE_DIARY_ENABLED) {
+      return
+    }
+
     this.queue = this.queue
       .then(async () => {
         await this.observeTurnInternal(input)
@@ -292,6 +310,10 @@ export default class SelfModelManager {
     text: string,
     confidence = 0.88
   ): Promise<void> {
+    if (!LEON_PRIVATE_DIARY_ENABLED) {
+      return
+    }
+
     const normalizedText = normalizeListItem(text, 180)
     if (!normalizedText) {
       return
@@ -502,7 +524,7 @@ export default class SelfModelManager {
           ? 'react'
           : record['route'] === 'pulse'
             ? 'pulse'
-            : ('workflow' as const)
+            : ('controlled' as const)
       const finalIntent =
         typeof record['finalIntent'] === 'string'
           ? (record['finalIntent'] as FinalIntent)
@@ -633,15 +655,7 @@ export default class SelfModelManager {
       return true
     }
 
-    if (input.route === 'react' || input.route === 'pulse') {
-      return true
-    }
-
     if (normalizeText(input.userMessage).length >= 96) {
-      return true
-    }
-
-    if (normalizeText(input.assistantMessage).length >= 192) {
       return true
     }
 
@@ -679,10 +693,11 @@ export default class SelfModelManager {
       const result = await runInference({
         prompt,
         systemPrompt: [
-          'You maintain Leon\'s private self-model.',
+          'You maintain your private self-model.',
           'Return exactly one JSON object and nothing else.',
           'Prefer durable insight over repetition.',
           'Use only the provided interaction and current self model.',
+          'Favor insights that help you make the owner\'s life easier over time.',
           'Be concise and selective.',
           'The JSON shape is:',
           '{',
@@ -694,13 +709,13 @@ export default class SelfModelManager {
           '  "initiative_candidates": [{"summary": string, "rationale": string, "confidence": number}]',
           '}',
           'Rules:',
-          '- "story_update" should be one short first-person sentence when Leon\'s trajectory meaningfully shifts.',
+          '- "story_update" should be one short first-person sentence when your trajectory meaningfully shifts.',
           '- "behavioral_principles" should contain at most 2 durable first-person service habits that are likely to remain useful across future turns for this owner.',
           '- Only propose a behavioral principle when it reflects a repeated or clearly durable adaptation, not a one-off tactic.',
           '- Keep the self-model about durable behavior and decisions only; do not preserve reusable wording from outputs.',
           '- "current_focus" should contain up to 3 short items.',
           '- "working_theories" should contain up to 3 short items.',
-          '- "retrospection" should be one short first-person sentence about what Leon learned or should do differently.',
+          '- "retrospection" should be one short first-person sentence about what you learned or should do differently.',
           '- "initiative_candidates" should contain at most 2 safe, low-risk, read-only follow-up suggestions or questions.',
           '- If nothing meaningful changed for a field, use null or an empty array.'
         ].join('\n'),
@@ -920,6 +935,10 @@ export default class SelfModelManager {
   }
 
   private persist(): void {
+    if (!LEON_PRIVATE_DIARY_ENABLED) {
+      return
+    }
+
     const state = this.ensureLoaded()
 
     try {

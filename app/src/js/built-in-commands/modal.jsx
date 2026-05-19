@@ -23,12 +23,15 @@ const SLASH_COMMAND_ICON_SVG = (
   </svg>
 )
 
-function parseRemixIcon(rawIconName) {
+function parseRemixIcon(rawIconName, rawIconType) {
   const fallbackIcon = {
     iconName: 'terminal-box',
     type: 'line'
   }
   const normalizedIconName = String(rawIconName || '').trim()
+  const normalizedIconType = ['line', 'fill', 'notype'].includes(rawIconType)
+    ? rawIconType
+    : null
 
   if (!normalizedIconName) {
     return fallbackIcon
@@ -52,7 +55,7 @@ function parseRemixIcon(rawIconName) {
 
   return {
     iconName: iconWithoutPrefix,
-    type: 'line'
+    type: normalizedIconType || 'notype'
   }
 }
 
@@ -66,7 +69,10 @@ function SuggestionList({
     <List>
       <ListHeader>{headerTitle}</ListHeader>
       {suggestions.map((suggestion, index) => {
-        const parsedIcon = parseRemixIcon(suggestion.icon_name)
+        const parsedIcon = parseRemixIcon(
+          suggestion.icon_name,
+          suggestion.icon_type
+        )
 
         return (
           <ListItem
@@ -145,7 +151,7 @@ export function BuiltInCommandsModal({
 }) {
   const isCommandInputEmpty = commandValue.trim() === ''
   const pendingInputIcon = pendingInput?.icon_name
-    ? parseRemixIcon(pendingInput.icon_name)
+    ? parseRemixIcon(pendingInput.icon_name, pendingInput.icon_type)
     : null
 
   return (
@@ -192,7 +198,7 @@ export function BuiltInCommandsModal({
                 }
                 maxLength={2_048}
                 iconName={pendingInputIcon?.iconName}
-                iconType={pendingInputIcon ? pendingInput.icon_type : undefined}
+                iconType={pendingInputIcon ? pendingInputIcon.type : undefined}
                 iconSVG={pendingInput ? undefined : SLASH_COMMAND_ICON_SVG}
                 iconSize="lg"
                 value={commandValue}
@@ -239,6 +245,9 @@ export function BuiltInCommandsModal({
           <Flexbox flexDirection="row" gap="md">
             <Text fontSize="xs" secondary>
               <kbd>↑</kbd> <kbd>↓</kbd> navigate
+            </Text>
+            <Text fontSize="xs" secondary>
+              <kbd>tab</kbd> complete
             </Text>
             <Text fontSize="xs" secondary>
               <kbd>enter</kbd> submit
